@@ -1,18 +1,22 @@
 //! Symbol lookup helpers + map-area / patch-config fillers.
 //!
-//! Port of upstream `tools/symbol.{c,h}`. Sits on top of the kallsym
-//! parser and handles the couple of real-world quirks: suffixed
-//! symbols (IPA-SRA produces `avc_denied.isra.5`), pair-wise `PAC` /
-//! `AUT` instruction NOP-out inside the reserved map area, and the
-//! fallback ladder when upstream renames symbols across kernel
+//! Port of upstream `tools/symbol.{c,h}` at KernelPatch 0.13.2. Sits
+//! on top of the kallsym parser and handles the couple of real-world
+//! quirks: suffixed symbols (IPA-SRA produces `avc_denied.isra.5`),
+//! pair-wise `PAC` / `AUT` instruction NOP-out inside the reserved
+//! map area, GKI-aware map selection, usable-offset filtering, and
+//! the fallback ladder when upstream renames symbols across kernel
 //! revisions (`memblock_alloc_try_nid` taking over for
 //! `memblock_{phys,virt}_alloc_try_nid`, `cgroup_init` for
 //! `rest_init`, etc).
 
-use kptools_base::{Error, Result, logi};
+use kptools_base::{logi, Error, Result};
 
-use crate::kallsym::{Kallsym, get_symbol_offset, get_symbol_offset_zero, on_each_symbol};
-use crate::preset::{MapSymbol, PatchConfig};
+use crate::kallsym::{get_symbol_offset, get_symbol_offset_zero, on_each_symbol, Kallsym};
+use crate::preset::{
+    MapSymbol, PatchConfig, MAP_SYM_MEMBLOCK_ALLOC_TRY_NID, MAP_SYM_MEMBLOCK_PHYS_ALLOC_TRY_NID,
+    MAP_SYM_MEMBLOCK_VIRT_ALLOC_FROM_ALLOC_TRY_NID, MAP_SYM_MEMBLOCK_VIRT_ALLOC_TRY_NID,
+};
 
 /// Find a symbol whose full name starts with `prefix.` or `prefix$`
 /// — gcc IPA-SRA / LTO tail variants. Upstream uses
@@ -64,6 +68,14 @@ fn align_floor(v: i32, a: i32) -> i32 {
     (v / a) * a
 }
 
+fn align_ceil(v: i32, a: i32) -> i32 {
+    if a == 0 {
+        v
+    } else {
+        ((v + a - 1) / a) * a
+    }
+}
+
 const NOP_INSN: u32 = 0xD503_201F;
 /// `(insn & PAC_MASK) == PAC_PATTERN` — PACIBSP / PACIASP / PACDBSP /
 /// PACDASP family.
@@ -71,12 +83,118 @@ const PAC_MASK: u32 = 0xFFFF_FD1F;
 const PAC_PATTERN: u32 = 0xD503_211F;
 const PAC_INSN: u32 = 0xD503_233F;
 
+/// Upstream `is_usable_symbol_offset` — reject offsets that land in
+/// the first/last page of the image (often relocation noise).
+pub fn is_usable_symbol_offset(offset: i32, imglen: i32) -> bool {
+    imglen >= 0x1000 && offset > 0 && offset <= imglen - 0x1000
+}
+
+/// Upstream `get_usable_symbol_offset_try` — exact name, then
+/// suffixed, only accepting usable offsets.
+pub fn get_usable_symbol_offset_try(info: &Kallsym, img: &[u8], imglen: i32, symbol: &str) -> i32 {
+    let offset = get_symbol_offset_zero(info, img, symbol);
+    if is_usable_symbol_offset(offset, imglen) {
+        return offset;
+    }
+    let offset = find_suffixed_symbol(info, img, symbol);
+    if is_usable_symbol_offset(offset, imglen) {
+        return offset;
+    }
+    0
+}
+
+/// Candidates used by the runtime forward-scan path when
+/// `kallsyms_lookup_name` is not directly usable.
+const LOOKUP_ANCHOR_CANDIDATES: &[&str] = &[
+    "show_stack",
+    "dump_backtrace",
+    "nmi_panic",
+    "panic",
+    "show_freq_kernel_log",
+    "input_handle_event",
+    "slow_avc_audit",
+    "avc_denied",
+    "tcp_init_sock",
+    "udp_init_sock",
+    "inet_create",
+    "inet_release",
+    "sock_init_data",
+    "sk_alloc",
+];
+
+/// Candidates for the reserved map area anchor.
+const MAP_ANCHOR_CANDIDATES: &[&str] = &[
+    "tcp_init_sock",
+    "udp_init_sock",
+    "inet_create",
+    "inet_release",
+    "sock_init_data",
+    "sk_alloc",
+    "input_handle_event",
+    "slow_avc_audit",
+    "avc_denied",
+    "nmi_panic",
+    "panic",
+    "kern_addr_valid",
+    "set_memory_rw",
+    "set_memory_ro",
+    "free_initmem",
+];
+
+/// Upstream `select_symbol_lookup_anchor_offset`.
+pub fn select_symbol_lookup_anchor_offset(
+    info: &Kallsym,
+    img: &[u8],
+    imglen: i32,
+) -> (i32, Option<&'static str>) {
+    for name in LOOKUP_ANCHOR_CANDIDATES {
+        let offset = get_usable_symbol_offset_try(info, img, imglen, name);
+        if offset != 0 {
+            return (offset, Some(*name));
+        }
+    }
+    (0, None)
+}
+
+fn get_map_anchor_offset(info: &Kallsym, img: &[u8], imglen: i32) -> Result<(i32, &'static str)> {
+    for name in MAP_ANCHOR_CANDIDATES {
+        let offset = get_usable_symbol_offset_try(info, img, imglen, name);
+        if offset != 0 {
+            return Ok((offset, *name));
+        }
+    }
+    Err(Error::kallsym("no usable map anchor symbol"))
+}
+
 /// `select_map_area` — pick the reserved slab we overwrite with
-/// kpimg jumps. Upstream anchors on `tcp_init_sock`, aligns down to
-/// 16 bytes, reserves 0x800 bytes, then NOPs out every PAC-family
-/// instruction inside that window. Returns `(map_start, max_size)`.
-pub fn select_map_area(info: &Kallsym, img: &mut [u8]) -> Result<(i32, i32)> {
-    let addr = get_symbol_offset_exit(info, img, "tcp_init_sock")?;
+/// kpimg jumps.
+///
+/// 0.13.2 behaviour:
+/// - choose the first usable map-anchor candidate (not just
+///   `tcp_init_sock`);
+/// - non-GKI kernels take the cold-text range starting at the
+///   aligned-up anchor and skip the PAC-NOP pass;
+/// - GKI kernels keep the previous PAC-pair NOP path, aligning the
+///   anchor down to 16 bytes.
+///
+/// Returns `(map_start, max_size)`.
+pub fn select_map_area(
+    info: &Kallsym,
+    img: &mut [u8],
+    imglen: i32,
+    is_gki: bool,
+) -> Result<(i32, i32)> {
+    let (addr, selected) = get_map_anchor_offset(info, img, imglen)?;
+    logi!("select map anchor: {selected}, offset: 0x{addr:08x}");
+
+    if !is_gki {
+        // For non-GKI kernels, use the area starting from a cold
+        // text symbol for mapping without PAC-pair surgery.
+        let map_start = align_ceil(addr, 16);
+        let max_size = 0x800;
+        return Ok((map_start, max_size));
+    }
+
     let map_start = align_floor(addr, 16);
     let max_size: i32 = 0x800;
 
@@ -104,7 +222,7 @@ pub fn select_map_area(info: &Kallsym, img: &mut [u8]) -> Result<(i32, i32)> {
     if !first_pac_seen {
         logi!("no first pac instruction found");
     }
-    if count % 2 != 0 {
+    if !count.is_multiple_of(2) {
         logi!("pac verify not pair pos: {last_pos:x} count: {count}");
         let mut second_pos: i32 = 0;
         let mut j = max_size;
@@ -132,44 +250,65 @@ pub fn select_map_area(info: &Kallsym, img: &mut [u8]) -> Result<(i32, i32)> {
 }
 
 /// Port of upstream `fillin_map_symbol`. Resolves the five memblock
-/// relocation symbols + folds the `memblock_alloc_try_nid` fallback
-/// when the `_phys` / `_virt` variants aren't exported.
+/// relocation symbols + records which phys/virt alloc fallback was
+/// selected via the two type fields added in 0.13.2.
 ///
 /// Host/target endianness swap lives in the caller (patch.rs); we
-/// write native-endian values here.
+/// write native-endian values here. The whole struct is zeroed
+/// first so unused type fields stay at `MAP_SYM_NONE`.
 pub fn fillin_map_symbol(info: &Kallsym, img: &[u8]) -> Result<MapSymbol> {
-    let memblock_reserve = get_symbol_offset_exit(info, img, "memblock_reserve")? as u64;
-    let memblock_free = get_symbol_offset_exit(info, img, "memblock_free")? as u64;
-    let memblock_mark_nomap = get_symbol_offset_zero(info, img, "memblock_mark_nomap") as u64;
+    let mut symbol = MapSymbol {
+        memblock_reserve_relo: 0,
+        memblock_free_relo: 0,
+        memblock_phys_alloc_relo: 0,
+        memblock_virt_alloc_relo: 0,
+        memblock_mark_nomap_relo: 0,
+        memblock_phys_alloc_type: 0,
+        memblock_virt_alloc_type: 0,
+    };
 
-    let mut memblock_phys_alloc =
+    symbol.memblock_reserve_relo = get_symbol_offset_exit(info, img, "memblock_reserve")? as u64;
+    symbol.memblock_free_relo = get_symbol_offset_exit(info, img, "memblock_free")? as u64;
+    symbol.memblock_mark_nomap_relo =
+        get_symbol_offset_zero(info, img, "memblock_mark_nomap") as u64;
+
+    symbol.memblock_phys_alloc_relo =
         get_symbol_offset_zero(info, img, "memblock_phys_alloc_try_nid") as u64;
-    let mut memblock_virt_alloc =
-        get_symbol_offset_zero(info, img, "memblock_virt_alloc_try_nid") as u64;
-    if memblock_phys_alloc == 0 && memblock_virt_alloc == 0 {
-        // Explicit message matches upstream's first check.
-        // (The C code re-checks after the `memblock_alloc_try_nid`
-        // fallback, but returning early here is the same result.)
-    }
-    let memblock_alloc_try_nid =
-        get_symbol_offset_zero(info, img, "memblock_alloc_try_nid") as u64;
-    if memblock_phys_alloc == 0 {
-        memblock_phys_alloc = memblock_alloc_try_nid;
-    }
-    if memblock_virt_alloc == 0 {
-        memblock_virt_alloc = memblock_alloc_try_nid;
-    }
-    if memblock_phys_alloc == 0 && memblock_virt_alloc == 0 {
-        return Err(Error::kallsym("no symbol memblock_alloc"));
+    if symbol.memblock_phys_alloc_relo != 0 {
+        symbol.memblock_phys_alloc_type = MAP_SYM_MEMBLOCK_PHYS_ALLOC_TRY_NID;
     }
 
-    Ok(MapSymbol {
-        memblock_reserve_relo: memblock_reserve,
-        memblock_free_relo: memblock_free,
-        memblock_phys_alloc_relo: memblock_phys_alloc,
-        memblock_virt_alloc_relo: memblock_virt_alloc,
-        memblock_mark_nomap_relo: memblock_mark_nomap,
-    })
+    symbol.memblock_virt_alloc_relo =
+        get_symbol_offset_zero(info, img, "memblock_virt_alloc_try_nid") as u64;
+    if symbol.memblock_virt_alloc_relo != 0 {
+        symbol.memblock_virt_alloc_type = MAP_SYM_MEMBLOCK_VIRT_ALLOC_TRY_NID;
+    }
+
+    let memblock_alloc_try_nid = get_symbol_offset_zero(info, img, "memblock_alloc_try_nid") as u64;
+    if symbol.memblock_phys_alloc_relo == 0 && memblock_alloc_try_nid != 0 {
+        symbol.memblock_phys_alloc_relo = memblock_alloc_try_nid;
+        symbol.memblock_phys_alloc_type = MAP_SYM_MEMBLOCK_ALLOC_TRY_NID;
+    }
+    if symbol.memblock_virt_alloc_relo == 0 && memblock_alloc_try_nid != 0 {
+        symbol.memblock_virt_alloc_relo = memblock_alloc_try_nid;
+        symbol.memblock_virt_alloc_type = MAP_SYM_MEMBLOCK_VIRT_ALLOC_FROM_ALLOC_TRY_NID;
+    }
+
+    if symbol.memblock_phys_alloc_relo == 0 {
+        return Err(Error::kallsym(
+            "no symbol memblock_phys_alloc_try_nid or memblock_alloc_try_nid",
+        ));
+    }
+    if symbol.memblock_virt_alloc_relo == 0 {
+        return Err(Error::kallsym(
+            "no symbol memblock_virt_alloc_try_nid or memblock_alloc_try_nid",
+        ));
+    }
+    if symbol.memblock_phys_alloc_type == MAP_SYM_MEMBLOCK_ALLOC_TRY_NID {
+        logi!("use memblock_alloc_try_nid as map phys alloc");
+    }
+
+    Ok(symbol)
 }
 
 /// Port of upstream `fillin_patch_config`. Resolves every kernel
@@ -178,6 +317,7 @@ pub fn fillin_map_symbol(info: &Kallsym, img: &[u8]) -> Result<MapSymbol> {
 pub fn fillin_patch_config(
     info: &Kallsym,
     img: &[u8],
+    imglen: i32,
     is_android: bool,
 ) -> Result<PatchConfig> {
     let mut cfg = PatchConfig {
@@ -198,6 +338,16 @@ pub fn fillin_patch_config(
         patch_su_config: 0,
         pad: [0; crate::preset::PATCH_CONFIG_LEN - 14 * 8 - 1],
     };
+
+    cfg.kallsyms_lookup_name =
+        get_usable_symbol_offset_try(info, img, imglen, "kallsyms_lookup_name") as u64;
+    cfg.printk = get_symbol_offset_zero(info, img, "printk") as u64;
+    if cfg.printk == 0 {
+        cfg.printk = get_symbol_offset_zero(info, img, "_printk") as u64;
+    }
+    if cfg.printk == 0 {
+        return Err(Error::kallsym("no symbol printk"));
+    }
 
     cfg.panic = get_symbol_offset_zero(info, img, "panic") as u64;
     cfg.rest_init = try_get_symbol_offset_zero(info, img, "rest_init") as u64;
@@ -229,4 +379,25 @@ pub fn fillin_patch_config(
     cfg.input_handle_event = get_symbol_offset_zero(info, img, "input_handle_event") as u64;
 
     Ok(cfg)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn usable_offset_bounds() {
+        assert!(!is_usable_symbol_offset(0, 0x2000));
+        assert!(!is_usable_symbol_offset(0x100, 0x800));
+        assert!(is_usable_symbol_offset(0x1000, 0x3000));
+        assert!(!is_usable_symbol_offset(0x2800, 0x3000));
+        assert!(is_usable_symbol_offset(0x2000, 0x3000));
+    }
+
+    #[test]
+    fn align_helpers() {
+        assert_eq!(align_floor(0x1234, 16), 0x1230);
+        assert_eq!(align_ceil(0x1231, 16), 0x1240);
+        assert_eq!(align_ceil(0x1230, 16), 0x1230);
+    }
 }

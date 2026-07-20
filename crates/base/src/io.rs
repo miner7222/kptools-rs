@@ -46,13 +46,21 @@ pub fn write_file(path: &Path, data: &[u8]) -> Result<()> {
 /// Round `v` up to the next multiple of `a`.
 #[inline]
 pub const fn align_ceil(v: usize, a: usize) -> usize {
-    if a == 0 { v } else { v.div_ceil(a) * a }
+    if a == 0 {
+        v
+    } else {
+        v.div_ceil(a) * a
+    }
 }
 
 /// Round `u64` up to the next multiple of `a`.
 #[inline]
 pub const fn align_ceil_u64(v: u64, a: u64) -> u64 {
-    if a == 0 { v } else { v.div_ceil(a) * a }
+    if a == 0 {
+        v
+    } else {
+        v.div_ceil(a) * a
+    }
 }
 
 #[cfg(test)]

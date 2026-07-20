@@ -33,7 +33,11 @@ pub const fn is_b(insn: u32) -> bool {
 #[inline]
 pub const fn bits32(insn: u32, high: u32, low: u32) -> u32 {
     let width = high - low + 1;
-    let mask = if width == 32 { u32::MAX } else { (1u32 << width) - 1 };
+    let mask = if width == 32 {
+        u32::MAX
+    } else {
+        (1u32 << width) - 1
+    };
     (insn >> low) & mask
 }
 
@@ -109,10 +113,22 @@ pub enum InsnClass {
 /// Upstream `aarch64_insn_encoding_class[]` — indexed by bits `[28:25]`
 /// of the instruction word. See ARM ARM v8 Profile-A, section C3.1.
 const INSN_CLASS_TABLE: [InsnClass; 16] = [
-    InsnClass::Unknown, InsnClass::Unknown, InsnClass::Unknown, InsnClass::Unknown,
-    InsnClass::Ldst,    InsnClass::DpReg,   InsnClass::Ldst,    InsnClass::DpFpsimd,
-    InsnClass::DpImm,   InsnClass::DpImm,   InsnClass::BrSys,   InsnClass::BrSys,
-    InsnClass::Ldst,    InsnClass::DpReg,   InsnClass::Ldst,    InsnClass::DpFpsimd,
+    InsnClass::Unknown,
+    InsnClass::Unknown,
+    InsnClass::Unknown,
+    InsnClass::Unknown,
+    InsnClass::Ldst,
+    InsnClass::DpReg,
+    InsnClass::Ldst,
+    InsnClass::DpFpsimd,
+    InsnClass::DpImm,
+    InsnClass::DpImm,
+    InsnClass::BrSys,
+    InsnClass::BrSys,
+    InsnClass::Ldst,
+    InsnClass::DpReg,
+    InsnClass::Ldst,
+    InsnClass::DpFpsimd,
 ];
 
 /// Upstream `aarch64_get_insn_class(insn)`.
@@ -227,7 +243,10 @@ mod tests {
         // `mrs x1, sp_el0` = 0xD5384101.
         let insn = 0xD538_4101u32;
         assert_eq!(aarch64_get_insn_class(insn), InsnClass::BrSys);
-        assert_eq!(aarch64_insn_extract_system_reg(insn), AARCH64_INSN_SPCLREG_SP_EL0);
+        assert_eq!(
+            aarch64_insn_extract_system_reg(insn),
+            AARCH64_INSN_SPCLREG_SP_EL0
+        );
     }
 
     #[test]

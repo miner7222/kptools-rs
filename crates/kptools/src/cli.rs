@@ -11,13 +11,13 @@
 
 use std::path::PathBuf;
 
-use kptools_base::{Error, Result, logi};
+use kptools_base::{Error, Result};
 
-use crate::preset::ExtraType;
 use crate::patch::{self, ExtraConfig, PatchArgs};
+use crate::preset::ExtraType;
 
 pub fn version_u32() -> u32 {
-    crate::preset::pack_version(0, 13, 1)
+    crate::preset::KP_VERSION_U32
 }
 
 pub fn main(argv: Vec<String>) -> Result<i32> {
@@ -47,7 +47,11 @@ pub fn main(argv: Vec<String>) -> Result<i32> {
             }
             "repack" => {
                 kptools_base::log::set_log_enable(true);
-                let out = if argv.len() > 3 { &argv[3] } else { "new-boot.img" };
+                let out = if argv.len() > 3 {
+                    &argv[3]
+                } else {
+                    "new-boot.img"
+                };
                 crate::bootimg::repack_bootimg(
                     std::path::Path::new(&argv[2]),
                     std::path::Path::new("kernel"),
@@ -194,13 +198,18 @@ pub fn main(argv: Vec<String>) -> Result<i32> {
             let kimg = kimg.ok_or_else(|| Error::invalid_arg("missing -i"))?;
             let kpimg = kpimg.ok_or_else(|| Error::invalid_arg("missing -k"))?;
             let out = out.ok_or_else(|| Error::invalid_arg("missing -o"))?;
-            let skey = superkey.ok_or_else(|| Error::invalid_arg("missing -s"))?;
+            // 0.13.2: if neither -s nor -S supplied, fall back to root-key
+            // mode with an empty superkey (upstream `if (!superkey) root_skey = true`).
+            let (skey, root) = match superkey {
+                Some(s) => (s, root_skey),
+                None => (String::new(), true),
+            };
             patch::patch_update_img(PatchArgs {
                 kimg_path: &kimg,
                 kpimg_path: &kpimg,
                 out_path: &out,
                 superkey: &skey,
-                root_key: root_skey,
+                root_key: root,
                 additional,
                 extras,
             })?;

@@ -23,27 +23,51 @@ pub const fn is_be() -> bool {
 /// `is_be() ^ kinfo.is_be` site.
 #[inline]
 pub fn swap_i16_if(v: i16, swap: bool) -> i16 {
-    if swap { v.swap_bytes() } else { v }
+    if swap {
+        v.swap_bytes()
+    } else {
+        v
+    }
 }
 #[inline]
 pub fn swap_u16_if(v: u16, swap: bool) -> u16 {
-    if swap { v.swap_bytes() } else { v }
+    if swap {
+        v.swap_bytes()
+    } else {
+        v
+    }
 }
 #[inline]
 pub fn swap_i32_if(v: i32, swap: bool) -> i32 {
-    if swap { v.swap_bytes() } else { v }
+    if swap {
+        v.swap_bytes()
+    } else {
+        v
+    }
 }
 #[inline]
 pub fn swap_u32_if(v: u32, swap: bool) -> u32 {
-    if swap { v.swap_bytes() } else { v }
+    if swap {
+        v.swap_bytes()
+    } else {
+        v
+    }
 }
 #[inline]
 pub fn swap_i64_if(v: i64, swap: bool) -> i64 {
-    if swap { v.swap_bytes() } else { v }
+    if swap {
+        v.swap_bytes()
+    } else {
+        v
+    }
 }
 #[inline]
 pub fn swap_u64_if(v: u64, swap: bool) -> u64 {
-    if swap { v.swap_bytes() } else { v }
+    if swap {
+        v.swap_bytes()
+    } else {
+        v
+    }
 }
 
 /// `is_be() ^ kinfo.is_be` shorthand.

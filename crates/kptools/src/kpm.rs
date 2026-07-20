@@ -141,12 +141,13 @@ pub fn get_kpm_info(kpm: &[u8]) -> Result<KpmInfo> {
     }
     let info_bytes = &kpm[info_off..info_off + info_size];
 
-    let mut out = KpmInfo::default();
-    out.name = modinfo_lookup(info_bytes, "name");
-    out.version = modinfo_lookup(info_bytes, "version");
-    out.license = modinfo_lookup(info_bytes, "license");
-    out.author = modinfo_lookup(info_bytes, "author");
-    out.description = modinfo_lookup(info_bytes, "description");
+    let out = KpmInfo {
+        name: modinfo_lookup(info_bytes, "name"),
+        version: modinfo_lookup(info_bytes, "version"),
+        license: modinfo_lookup(info_bytes, "license"),
+        author: modinfo_lookup(info_bytes, "author"),
+        description: modinfo_lookup(info_bytes, "description"),
+    };
     Ok(out)
 }
 
@@ -169,16 +170,14 @@ fn parse_shdrs(kpm: &[u8], shoff: usize, shnum: usize) -> Result<Vec<Elf64Shdr>>
     let stride = core::mem::size_of::<Elf64Shdr>();
     for i in 0..shnum {
         let start = shoff + i * stride;
-        out.push(*bytemuck::from_bytes::<Elf64Shdr>(&kpm[start..start + stride]));
+        out.push(*bytemuck::from_bytes::<Elf64Shdr>(
+            &kpm[start..start + stride],
+        ));
     }
     Ok(out)
 }
 
-fn find_sec<'a>(
-    sechdrs: &'a [Elf64Shdr],
-    secstrings: &[u8],
-    name: &str,
-) -> Option<&'a Elf64Shdr> {
+fn find_sec<'a>(sechdrs: &'a [Elf64Shdr], secstrings: &[u8], name: &str) -> Option<&'a Elf64Shdr> {
     for shdr in sechdrs.iter().skip(1) {
         if shdr.sh_flags & SHF_ALLOC == 0 {
             continue;
@@ -232,7 +231,7 @@ mod tests {
         // Place `.kpm.info` contents right after the ehdr.
         let info_off = buf.len();
         buf.extend_from_slice(info_bytes);
-        while buf.len() % 8 != 0 {
+        while !buf.len().is_multiple_of(8) {
             buf.push(0);
         }
 
@@ -243,7 +242,7 @@ mod tests {
         buf.extend_from_slice(b".kpm.info\0");
         let shstr_name_idx = buf.len() - strtab_off;
         buf.extend_from_slice(b".shstrtab\0");
-        while buf.len() % 8 != 0 {
+        while !buf.len().is_multiple_of(8) {
             buf.push(0);
         }
         let strtab_size = buf.len() - strtab_off;

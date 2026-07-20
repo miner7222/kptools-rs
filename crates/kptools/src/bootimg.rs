@@ -27,7 +27,7 @@ use std::io::{Read, Write};
 use std::path::Path;
 
 use bytemuck::{Pod, Zeroable};
-use kptools_base::{Error, Result, io::write_file, logi, logw};
+use kptools_base::{io::write_file, logi, Error, Result};
 
 pub const BOOT_MAGIC: &[u8; 8] = b"ANDROID!";
 pub const PAGE_SIZE_DEFAULT: u32 = 4096;
@@ -150,9 +150,21 @@ fn decompress_gzip_to(data: &[u8], out_path: &Path) -> Result<()> {
 }
 
 fn compress_gzip(data: &[u8]) -> Result<Vec<u8>> {
-    use flate2::Compression;
     use flate2::write::GzEncoder;
+    use flate2::Compression;
     let mut enc = GzEncoder::new(Vec::new(), Compression::new(9));
+    enc.write_all(data).map_err(Error::Io)?;
+    enc.finish().map_err(|e| Error::compress(e.to_string()))
+}
+
+/// Upstream `compress_raw_deflate` — raw DEFLATE (no zlib/gzip wrapper).
+/// Added in KernelPatch 0.13.2; not yet wired into the repack path but
+/// kept as a host-tools helper for parity with `tools/bootimg.c`.
+#[allow(dead_code)]
+fn compress_raw_deflate(data: &[u8]) -> Result<Vec<u8>> {
+    use flate2::write::DeflateEncoder;
+    use flate2::Compression;
+    let mut enc = DeflateEncoder::new(Vec::new(), Compression::new(9));
     enc.write_all(data).map_err(Error::Io)?;
     enc.finish().map_err(|e| Error::compress(e.to_string()))
 }
@@ -160,7 +172,8 @@ fn compress_gzip(data: &[u8]) -> Result<Vec<u8>> {
 fn decompress_lz4_frame_to(data: &[u8], out_path: &Path) -> Result<()> {
     let mut dec = lz4::Decoder::new(data).map_err(|e| Error::decompress(e.to_string()))?;
     let mut buf = Vec::with_capacity(64 * 1024 * 1024);
-    dec.read_to_end(&mut buf).map_err(|e| Error::decompress(e.to_string()))?;
+    dec.read_to_end(&mut buf)
+        .map_err(|e| Error::decompress(e.to_string()))?;
     write_file(out_path, &buf)
 }
 
@@ -188,7 +201,7 @@ fn decompress_lz4_legacy_to(data: &[u8], out_path: &Path) -> Result<()> {
     }
     let mut pos = 4usize;
     let mut out = Vec::with_capacity(64 * 1024 * 1024);
-    let mut block_out = vec![0u8; LZ4_BLOCK_SIZE];
+    let _block_out = vec![0u8; LZ4_BLOCK_SIZE];
     loop {
         if pos + 4 > data.len() {
             break;
@@ -218,9 +231,12 @@ fn compress_lz4_legacy(data: &[u8]) -> Result<Vec<u8>> {
         // High-compression block encode. lz4_flex's high-compression
         // block path is not directly exposed as `compress_hc`, so we
         // use the `lz4` crate's block API which supports HC level.
-        let mut compressed =
-            lz4::block::compress(chunk, Some(lz4::block::CompressionMode::HIGHCOMPRESSION(12)), false)
-                .map_err(|e| Error::compress(e.to_string()))?;
+        let mut compressed = lz4::block::compress(
+            chunk,
+            Some(lz4::block::CompressionMode::HIGHCOMPRESSION(12)),
+            false,
+        )
+        .map_err(|e| Error::compress(e.to_string()))?;
         // `lz4::block::compress` with `prepend_size=false` returns
         // raw bytes. We prepend our own length.
         let bs = compressed.len() as u32;
@@ -234,13 +250,14 @@ fn decompress_bzip2_to(data: &[u8], out_path: &Path) -> Result<()> {
     use bzip2::read::BzDecoder;
     let mut dec = BzDecoder::new(data);
     let mut buf = Vec::with_capacity(64 * 1024 * 1024);
-    dec.read_to_end(&mut buf).map_err(|e| Error::decompress(e.to_string()))?;
+    dec.read_to_end(&mut buf)
+        .map_err(|e| Error::decompress(e.to_string()))?;
     write_file(out_path, &buf)
 }
 
 fn compress_bzip2(data: &[u8]) -> Result<Vec<u8>> {
-    use bzip2::Compression;
     use bzip2::write::BzEncoder;
+    use bzip2::Compression;
     let mut enc = BzEncoder::new(Vec::new(), Compression::new(9));
     enc.write_all(data).map_err(Error::Io)?;
     enc.finish().map_err(|e| Error::compress(e.to_string()))
@@ -250,7 +267,8 @@ fn decompress_xz_to(data: &[u8], out_path: &Path) -> Result<()> {
     use lzma_rust2::XzReader;
     let mut dec = XzReader::new(data, true);
     let mut buf = Vec::with_capacity(64 * 1024 * 1024);
-    dec.read_to_end(&mut buf).map_err(|e| Error::decompress(e.to_string()))?;
+    dec.read_to_end(&mut buf)
+        .map_err(|e| Error::decompress(e.to_string()))?;
     write_file(out_path, &buf)
 }
 
@@ -258,8 +276,7 @@ fn compress_xz(data: &[u8]) -> Result<Vec<u8>> {
     use lzma_rust2::{CheckType, XzOptions, XzWriter};
     let mut opt = XzOptions::with_preset(9);
     opt.set_check_sum_type(CheckType::Crc32);
-    let mut enc = XzWriter::new(Vec::new(), opt)
-        .map_err(|e| Error::compress(e.to_string()))?;
+    let mut enc = XzWriter::new(Vec::new(), opt).map_err(|e| Error::compress(e.to_string()))?;
     enc.write_all(data).map_err(Error::Io)?;
     enc.finish().map_err(|e| Error::compress(e.to_string()))
 }
@@ -269,7 +286,8 @@ fn decompress_lzma_to(data: &[u8], out_path: &Path) -> Result<()> {
     let mut dec = LzmaReader::new_mem_limit(data, u32::MAX, None)
         .map_err(|e| Error::decompress(e.to_string()))?;
     let mut buf = Vec::with_capacity(64 * 1024 * 1024);
-    dec.read_to_end(&mut buf).map_err(|e| Error::decompress(e.to_string()))?;
+    dec.read_to_end(&mut buf)
+        .map_err(|e| Error::decompress(e.to_string()))?;
     write_file(out_path, &buf)
 }
 
@@ -283,10 +301,11 @@ fn compress_lzma(data: &[u8]) -> Result<Vec<u8>> {
 }
 
 fn decompress_zstd_to(data: &[u8], out_path: &Path) -> Result<()> {
-    let mut dec = zstd::stream::read::Decoder::new(data)
-        .map_err(|e| Error::decompress(e.to_string()))?;
+    let mut dec =
+        zstd::stream::read::Decoder::new(data).map_err(|e| Error::decompress(e.to_string()))?;
     let mut buf = Vec::with_capacity(64 * 1024 * 1024);
-    dec.read_to_end(&mut buf).map_err(|e| Error::decompress(e.to_string()))?;
+    dec.read_to_end(&mut buf)
+        .map_err(|e| Error::decompress(e.to_string()))?;
     write_file(out_path, &buf)
 }
 
@@ -375,14 +394,12 @@ pub fn extract_kernel(bootimg_path: &Path, out_path: &Path) -> Result<()> {
     if header_ver > 10 {
         kernel_offset = page_size;
     }
-    logi!(
-        "Kernel size: {kernel_size}, Header Version: {header_ver}, Offset: {kernel_offset}"
-    );
+    logi!("Kernel size: {kernel_size}, Header Version: {header_ver}, Offset: {kernel_offset}");
 
     let start = kernel_offset as usize;
-    let end = start.checked_add(kernel_size).ok_or_else(|| {
-        Error::bad_bootimg("kernel offset + size overflow")
-    })?;
+    let end = start
+        .checked_add(kernel_size)
+        .ok_or_else(|| Error::bad_bootimg("kernel offset + size overflow"))?;
     if end > data.len() {
         return Err(Error::bad_bootimg("kernel section past file end"));
     }
@@ -403,9 +420,7 @@ fn find_dtb_offset(buf: &[u8]) -> Option<usize> {
     const DTB_MAGIC: [u8; 4] = [0xd0, 0x0d, 0xfe, 0xed];
     let mut pos = 0usize;
     while pos + FDT_HEADER < buf.len() {
-        let Some(rel) = buf[pos..].windows(4).position(|w| w == DTB_MAGIC) else {
-            return None;
-        };
+        let rel = buf[pos..].windows(4).position(|w| w == DTB_MAGIC)?;
         let cand = pos + rel;
         if cand + FDT_HEADER > buf.len() {
             return None;
@@ -418,8 +433,11 @@ fn find_dtb_offset(buf: &[u8]) -> Option<usize> {
             continue;
         }
         if cand + off_dt_struct + 4 <= buf.len() {
-            let tag =
-                u32::from_be_bytes(buf[cand + off_dt_struct..cand + off_dt_struct + 4].try_into().unwrap());
+            let tag = u32::from_be_bytes(
+                buf[cand + off_dt_struct..cand + off_dt_struct + 4]
+                    .try_into()
+                    .unwrap(),
+            );
             if tag == 0x0000_0001 {
                 return Some(cand);
             }
@@ -430,7 +448,11 @@ fn find_dtb_offset(buf: &[u8]) -> Option<usize> {
 }
 
 fn align_up(v: u32, a: u32) -> u32 {
-    if a == 0 { v } else { ((v + a - 1) / a) * a }
+    if a == 0 {
+        v
+    } else {
+        v.div_ceil(a) * a
+    }
 }
 
 /// Port of upstream `repack_bootimg`. Pulls the new kernel from
@@ -470,9 +492,7 @@ pub fn repack_bootimg(
     } else {
         hdr.ramdisk_size
     };
-    logi!(
-        "Header Version: {header_ver}, Page Size: {page_size}, fmt_size: {fmt_size}"
-    );
+    logi!("Header Version: {header_ver}, Page Size: {page_size}, fmt_size: {fmt_size}");
 
     let old_k_start = page_size as usize;
     let old_k_end = old_k_start + hdr.kernel_size as usize;
@@ -487,12 +507,15 @@ pub fn repack_bootimg(
     if header_ver < 3 {
         if let Some(dtb_off) = find_dtb_offset(old_k) {
             extracted_dtb.extend_from_slice(&old_k[dtb_off..]);
-            logi!("Detected DTB appended to kernel. Size: {}", extracted_dtb.len());
+            logi!(
+                "Detected DTB appended to kernel. Size: {}",
+                extracted_dtb.len()
+            );
         }
     }
 
     let raw_k = kptools_base::io::read_file(new_kernel_path)?;
-    let raw_k_size = raw_k.len();
+    let _raw_k_size = raw_k.len();
 
     // Recompress to match the source method. XZ / LZMA fall back
     // to GZIP (upstream behaviour).
@@ -561,9 +584,7 @@ pub fn repack_bootimg(
             rest_data_size = tail_off + avb_size_of;
         } else {
             rest_buf = raw_rest[..tail_off].to_vec();
-            logi!(
-                "Rest data size: {rest_data_size_no_avb}, significant: {tail_off}"
-            );
+            logi!("Rest data size: {rest_data_size_no_avb}, significant: {tail_off}");
             rest_data_size = tail_off;
         }
     }
@@ -654,7 +675,7 @@ pub fn repack_bootimg(
         0x41, 0x56, 0x42, 0x30, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
         0x00, 0x00, 0x00, 0x00,
     ];
-    let mut rest_buf_local = rest_buf.clone();
+    let rest_buf_local = rest_buf.clone();
     if !rest_buf_local.is_empty() {
         let mut last_avb: Option<usize> = None;
         for ver in [0x00u8, 0x01, 0x02] {
@@ -675,8 +696,7 @@ pub fn repack_bootimg(
             }
         }
         if let Some(avb_offset) = last_avb {
-            let new_avb_size =
-                page_size + avb_offset as u32 + new_k_total_aligned as u32;
+            let new_avb_size = page_size + avb_offset as u32 + new_k_total_aligned as u32;
             avb.data_size1 = new_avb_size.swap_bytes();
             avb.data_size2 = new_avb_size.swap_bytes();
         }
@@ -687,8 +707,7 @@ pub fn repack_bootimg(
                 (page_size as usize + new_k_total_aligned + rest_data_size) as u32,
                 page_size,
             ) as usize;
-            let pad_len =
-                new_total - page_size as usize - new_k_total_aligned - avb_size_of;
+            let pad_len = new_total - page_size as usize - new_k_total_aligned - avb_size_of;
             out.extend_from_slice(&rest_buf_local[..pad_len.min(rest_buf_local.len())]);
             out.resize(page_size as usize + new_k_total_aligned + pad_len, 0);
             out.extend_from_slice(bytemuck::bytes_of(&avb));
@@ -712,7 +731,7 @@ pub fn repack_bootimg(
     Ok(())
 }
 
-fn sec_slice<'a>(buf: &'a [u8], off: u32, size: u32) -> &'a [u8] {
+fn sec_slice(buf: &[u8], off: u32, size: u32) -> &[u8] {
     let off = off as usize;
     let size = size as usize;
     if off >= buf.len() {
@@ -784,6 +803,15 @@ mod tests {
         let out = dir.path().join("out.bin");
         decompress_gzip_to(&gz, &out).unwrap();
         assert_eq!(std::fs::read(&out).unwrap(), plain);
+    }
+
+    #[test]
+    fn compress_raw_deflate_produces_output() {
+        let plain = b"raw deflate payload for kptools";
+        let out = compress_raw_deflate(plain).unwrap();
+        assert!(!out.is_empty());
+        // raw DEFLATE must not carry a gzip header (1f 8b)
+        assert_ne!(&out[..2.min(out.len())], &[0x1f, 0x8b]);
     }
 
     #[test]

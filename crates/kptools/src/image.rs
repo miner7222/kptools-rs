@@ -87,10 +87,9 @@ impl Arm64Hdr {
 
 /// Decode the arm64 header at the start of `img`.
 ///
-/// `page_shift` defaults to 12 (4 KiB) because the header itself
-/// does not carry it — upstream leaves the field zero and fills it
-/// later from `kinfo.page_shift` supplied elsewhere. We mirror that
-/// behaviour (set to 0, caller fills in).
+/// `page_shift` is recovered from the low nibble of
+/// `kernel_flag_le` the same way upstream `get_kernel_info` does:
+/// bits [2:1] encode 4K/16K/64K page size (defaults to 4K).
 pub fn get_kernel_info(img: &[u8]) -> Result<KernelInfo> {
     if img.len() < core::mem::size_of::<Arm64Hdr>() {
         return Err(Error::bad_kernel(format!(
@@ -107,8 +106,10 @@ pub fn get_kernel_info(img: &[u8]) -> Result<KernelInfo> {
         )));
     }
 
-    let mut info = KernelInfo::default();
-    info.is_be = 0;
+    let mut info = KernelInfo {
+        is_be: 0,
+        ..Default::default()
+    };
 
     let uefi = &hdr.hdr_raw[..2] == EFI_MAGIC;
     info.uefi = if uefi { 1 } else { 0 };
@@ -123,22 +124,31 @@ pub fn get_kernel_info(img: &[u8]) -> Result<KernelInfo> {
     info.b_stext_insn_offset = b_stext_insn_offset;
 
     // `b` instruction decode — upstream mirrors the `(insn &
-    // 0xFC000000) == 0x14000000` check. The `(insn << 2) >> 2`
-    // immediate sign-extends to the primary-entry offset.
+    // 0xFC000000) == 0x14000000` check. The immediate is
+    // left-shifted by 2 (byte offset) and added to the instruction
+    // offset.
     let b_insn = u32::from_le(b_primary_entry_insn);
     if (b_insn & 0xFC00_0000) != 0x1400_0000 {
         return Err(Error::bad_kernel(format!(
             "expected `b` at stext, got insn 0x{b_insn:08x}",
         )));
     }
-    let imm26 = (b_insn & 0x03FF_FFFF) as i32;
-    let imm26_sext = (imm26 << 6) >> 6; // sign-extend 26-bit
-    let primary_entry = b_stext_insn_offset + imm26_sext * 4;
-    info.primary_entry_offset = primary_entry;
+    let imm = ((b_insn & 0x03FF_FFFF) << 2) as i32;
+    info.primary_entry_offset = imm + b_stext_insn_offset;
 
-    info.kernel_size = u64::from_le(hdr.kernel_size_le) as i32;
     info.load_offset = u64::from_le(hdr.kernel_offset) as i32;
-    info.page_shift = 0; // upstream leaves it for caller
+    info.kernel_size = u64::from_le(hdr.kernel_size_le) as i32;
+
+    let flag = (u64::from_le(hdr.kernel_flag_le) & 0x0f) as u8;
+    info.is_be = (flag & 0x01) as i8;
+    if info.is_be != 0 {
+        return Err(Error::bad_kernel("kernel unexpected arm64 big endian img"));
+    }
+    info.page_shift = match (flag & 0b0110) >> 1 {
+        2 => 14, // 16k
+        3 => 16, // 64k
+        _ => 12, // 4k (case 1 + default)
+    };
 
     Ok(info)
 }
@@ -164,6 +174,7 @@ mod tests {
         assert_eq!(info.primary_entry_offset, 0x100);
         assert_eq!(info.load_offset, 0x80000);
         assert_eq!(info.kernel_size, 0x800000);
+        assert_eq!(info.page_shift, 12);
     }
 
     #[test]

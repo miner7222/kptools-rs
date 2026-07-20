@@ -1,16 +1,22 @@
 //! On-disk preset structures + constants.
 //!
 //! Direct port of upstream `kernel/include/preset.h`, pinned to
-//! tag 0.13.1. Field order, packing, and embedded size constants
+//! tag 0.13.2. Field order, packing, and embedded size constants
 //! match the C build byte-for-byte so a patched kernel produced by
 //! this crate is interchangeable with the one produced by the
 //! reference `kptools` binary.
 //!
 //! Every struct derives `bytemuck::{Pod, Zeroable}` so callers can
 //! reinterpret an mmap slice straight into `&preset_t` with zero
-//! copying. Size tests at the bottom pin every `_Static_assert` the
-//! C header carries — if one of those trips, the layout has drifted
-//! and downstream offsets would silently corrupt a patched kernel.
+//! copying. Size and offset tests at the bottom pin every
+//! `_Static_assert` the C header carries — if one of those trips,
+//! the layout has drifted and downstream offsets would silently
+//! corrupt a patched kernel.
+//!
+//! This crate only supports the 0.13.2 on-disk ABI (`kp_version`
+//! major/minor/patch = 0/13/2, encoded as `0x0d02`). A mismatched
+//! kpimg version must fail with a `Result` before any output is
+//! written.
 
 use bytemuck::{Pod, Zeroable};
 
@@ -40,8 +46,26 @@ pub const MAP_ALIGN: usize = 0x10;
 pub const CONFIG_DEBUG: u64 = 1 << 0;
 pub const CONFIG_ANDROID: u64 = 1 << 1;
 
-pub const MAP_SYMBOL_NUM: usize = 5;
+/// KernelPatch tools/kpimg version this port is built against.
+pub const KP_VERSION_MAJOR: u8 = 0;
+pub const KP_VERSION_MINOR: u8 = 13;
+pub const KP_VERSION_PATCH: u8 = 2;
+
+/// Packed `VERSION(0, 13, 2)` = `0x00000d02`.
+pub const KP_VERSION_U32: u32 = pack_version(KP_VERSION_MAJOR, KP_VERSION_MINOR, KP_VERSION_PATCH);
+
+pub const MAP_SYMBOL_NUM: usize = 7;
 pub const MAP_SYMBOL_SIZE: usize = MAP_SYMBOL_NUM * 8;
+
+pub const MAP_SYM_NONE: u64 = 0;
+pub const MAP_SYM_RESOLVE: u64 = 1;
+
+pub const MAP_SYM_MEMBLOCK_PHYS_ALLOC_TRY_NID: u64 = 1;
+pub const MAP_SYM_MEMBLOCK_ALLOC_TRY_NID: u64 = 2;
+pub const MAP_SYM_MEMBLOCK_FIND_IN_RANGE: u64 = 3;
+
+pub const MAP_SYM_MEMBLOCK_VIRT_ALLOC_TRY_NID: u64 = 1;
+pub const MAP_SYM_MEMBLOCK_VIRT_ALLOC_FROM_ALLOC_TRY_NID: u64 = 2;
 
 pub const PATCH_CONFIG_LEN: usize = 512;
 pub const ADDITIONAL_LEN: usize = 512;
@@ -140,6 +164,15 @@ impl VersionT {
     pub fn as_u32(self) -> u32 {
         ((self.major as u32) << 16) | ((self.minor as u32) << 8) | self.patch as u32
     }
+
+    pub const fn new(major: u8, minor: u8, patch: u8) -> Self {
+        Self {
+            reserved: 0,
+            patch,
+            minor,
+            major,
+        }
+    }
 }
 
 /// `version(major, minor, patch)` upstream macro.
@@ -170,7 +203,7 @@ pub struct SetupHeader {
 }
 
 // ---------------------------------------------------------------------------
-// map_symbol_t (40 bytes = 5 × u64)
+// map_symbol_t (56 bytes = 7 × u64)
 // ---------------------------------------------------------------------------
 
 #[repr(C, packed)]
@@ -181,6 +214,10 @@ pub struct MapSymbol {
     pub memblock_phys_alloc_relo: u64,
     pub memblock_virt_alloc_relo: u64,
     pub memblock_mark_nomap_relo: u64,
+    /// Which phys-alloc symbol was selected (`MAP_SYM_MEMBLOCK_*`).
+    pub memblock_phys_alloc_type: u64,
+    /// Which virt-alloc symbol was selected (`MAP_SYM_MEMBLOCK_*`).
+    pub memblock_virt_alloc_type: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -217,6 +254,11 @@ pub struct PatchConfig {
 // _patch_extra_item (128 bytes)
 // ---------------------------------------------------------------------------
 
+/// Explicit field sizes used by the 128-byte extra-item layout.
+/// `flags` is present in 0.13.2; the remaining pad keeps the item
+/// fixed at `PATCH_EXTRA_ITEM_LEN`.
+const EXTRA_ITEM_FIXED: usize = 4 + 4 + 4 + 4 + 4 + EXTRA_NAME_LEN + EXTRA_EVENT_LEN + 4;
+
 #[repr(C, packed)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 pub struct PatchExtraItem {
@@ -227,12 +269,23 @@ pub struct PatchExtraItem {
     pub extra_type: i32,
     pub name: [u8; EXTRA_NAME_LEN],
     pub event: [u8; EXTRA_EVENT_LEN],
-    pub pad: [u8; PATCH_EXTRA_ITEM_LEN - 4 - 4 - 4 - 4 - 4 - EXTRA_NAME_LEN - EXTRA_EVENT_LEN],
+    /// New in 0.13.2. Remains zero unless a caller sets it.
+    pub flags: i32,
+    pub pad: [u8; PATCH_EXTRA_ITEM_LEN - EXTRA_ITEM_FIXED],
 }
 
 // ---------------------------------------------------------------------------
 // setup_preset_t (current layout — version > 0xa04)
+//
+// After `root_superkey` the preserve window starts. 0.13.2 carves the
+// first 32 bytes of that 64-byte window into four i64 fields and keeps
+// the remaining 32 bytes as reserved pad. `patch_config` still starts
+// at `root_superkey + ROOT_SUPER_KEY_HASH_LEN + SETUP_PRESERVE_LEN`.
 // ---------------------------------------------------------------------------
+
+/// Bytes reserved after the four 0.13.2 setup fields inside the
+/// original `SETUP_PRESERVE_LEN` window.
+pub const SETUP_PRESERVE_REMAINING: usize = SETUP_PRESERVE_LEN - 32;
 
 #[repr(C, packed)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -255,8 +308,12 @@ pub struct SetupPreset {
     pub header_backup: [u8; HDR_BACKUP_SIZE],
     pub superkey: [u8; SUPER_KEY_LEN],
     pub root_superkey: [u8; ROOT_SUPER_KEY_HASH_LEN],
-    /// `uint8_t __[SETUP_PRESERVE_LEN]` in the C header.
-    pub preserve: [u8; SETUP_PRESERVE_LEN],
+    pub sprintf_offset: i64,
+    pub symbol_lookup_anchor_offset: i64,
+    pub kconfig_offset: i64,
+    pub kconfig_size: i64,
+    /// Remaining preserve capacity after the four i64 fields above.
+    pub preserve: [u8; SETUP_PRESERVE_REMAINING],
     pub patch_config: PatchConfig,
     pub additional: [u8; ADDITIONAL_LEN],
 }
@@ -273,13 +330,14 @@ pub struct Preset {
 }
 
 // ---------------------------------------------------------------------------
-// Layout sanity checks — must match upstream `_Static_assert` lines.
+// Layout sanity checks — must match upstream `_Static_assert` lines
+// and the assembly offset macros in `preset.h`.
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::mem::size_of;
+    use std::mem::{offset_of, size_of};
 
     #[test]
     fn size_version_t() {
@@ -295,6 +353,7 @@ mod tests {
     #[test]
     fn size_map_symbol() {
         assert_eq!(size_of::<MapSymbol>(), MAP_SYMBOL_SIZE);
+        assert_eq!(MAP_SYMBOL_SIZE, 56);
     }
 
     #[test]
@@ -305,28 +364,27 @@ mod tests {
     #[test]
     fn size_patch_extra_item() {
         assert_eq!(size_of::<PatchExtraItem>(), PATCH_EXTRA_ITEM_LEN);
+        assert_eq!(
+            offset_of!(PatchExtraItem, flags),
+            4 + 4 + 4 + 4 + 4 + EXTRA_NAME_LEN + EXTRA_EVENT_LEN
+        );
     }
 
     #[test]
     fn size_setup_preset_current() {
-        // Size isn't called out by a `_Static_assert` upstream, but
-        // the field sequence is tight. Recompute the expected tally
-        // to catch drift:
+        // Field sequence for 0.13.2:
         //   4  version_t
         //   4  reserved
-        //  12 × 8 = 96 i64 fields (kimg_size, kpimg_size,
-        //          kernel_size, page_shift, setup_offset,
-        //          start_offset, extra_size, map_offset,
-        //          map_max_size, kallsyms_lookup_name_offset,
-        //          paging_init_offset, printk_offset)
-        //  40 map_symbol
+        //  12 × 8 = 96 i64 fields
+        //  56 map_symbol (7 × u64)
         //   8 header_backup
         //  64 superkey
         //  32 root_superkey
-        //  64 preserve
+        //  32 four setup i64s (sprintf/lookup-anchor/kconfig)
+        //  32 preserve remainder
         // 512 patch_config
         // 512 additional
-        let expected = 4 + 4 + 12 * 8 + 40 + 8 + 64 + 32 + 64 + 512 + 512;
+        let expected = 4 + 4 + 12 * 8 + 56 + 8 + 64 + 32 + 32 + 32 + 512 + 512;
         assert_eq!(size_of::<SetupPreset>(), expected);
     }
 
@@ -335,6 +393,73 @@ mod tests {
         assert_eq!(
             size_of::<Preset>(),
             size_of::<SetupHeader>() + size_of::<SetupPreset>()
+        );
+    }
+
+    #[test]
+    fn setup_field_offsets_match_upstream_macros() {
+        // Mirrors the assembly offset macros in preset.h for 0.13.2.
+        assert_eq!(offset_of!(SetupPreset, kernel_version), 0);
+        assert_eq!(offset_of!(SetupPreset, kimg_size), 8);
+        assert_eq!(offset_of!(SetupPreset, kpimg_size), 16);
+        assert_eq!(offset_of!(SetupPreset, kernel_size), 24);
+        assert_eq!(offset_of!(SetupPreset, page_shift), 32);
+        assert_eq!(offset_of!(SetupPreset, setup_offset), 40);
+        assert_eq!(offset_of!(SetupPreset, start_offset), 48);
+        assert_eq!(offset_of!(SetupPreset, extra_size), 56);
+        assert_eq!(offset_of!(SetupPreset, map_offset), 64);
+        assert_eq!(offset_of!(SetupPreset, map_max_size), 72);
+        assert_eq!(offset_of!(SetupPreset, kallsyms_lookup_name_offset), 80);
+        assert_eq!(offset_of!(SetupPreset, paging_init_offset), 88);
+        assert_eq!(offset_of!(SetupPreset, printk_offset), 96);
+        assert_eq!(offset_of!(SetupPreset, map_symbol), 104);
+        assert_eq!(
+            offset_of!(SetupPreset, header_backup),
+            104 + MAP_SYMBOL_SIZE
+        );
+        assert_eq!(
+            offset_of!(SetupPreset, superkey),
+            104 + MAP_SYMBOL_SIZE + HDR_BACKUP_SIZE
+        );
+        assert_eq!(
+            offset_of!(SetupPreset, root_superkey),
+            104 + MAP_SYMBOL_SIZE + HDR_BACKUP_SIZE + SUPER_KEY_LEN
+        );
+        let root_off = offset_of!(SetupPreset, root_superkey);
+        assert_eq!(
+            offset_of!(SetupPreset, sprintf_offset),
+            root_off + ROOT_SUPER_KEY_HASH_LEN
+        );
+        assert_eq!(
+            offset_of!(SetupPreset, symbol_lookup_anchor_offset),
+            root_off + ROOT_SUPER_KEY_HASH_LEN + 8
+        );
+        assert_eq!(
+            offset_of!(SetupPreset, kconfig_offset),
+            root_off + ROOT_SUPER_KEY_HASH_LEN + 16
+        );
+        assert_eq!(
+            offset_of!(SetupPreset, kconfig_size),
+            root_off + ROOT_SUPER_KEY_HASH_LEN + 24
+        );
+        assert_eq!(
+            offset_of!(SetupPreset, patch_config),
+            root_off + ROOT_SUPER_KEY_HASH_LEN + SETUP_PRESERVE_LEN
+        );
+        // Relative offsets called out by the reproduction case.
+        // map_symbol starts at +104; phys/virt alloc type are the last
+        // two u64s of the 7-slot map_symbol block.
+        assert_eq!(
+            offset_of!(SetupPreset, map_symbol) + offset_of!(MapSymbol, memblock_phys_alloc_type),
+            104 + 5 * 8
+        );
+        assert_eq!(
+            offset_of!(SetupPreset, map_symbol) + offset_of!(MapSymbol, memblock_virt_alloc_type),
+            104 + 6 * 8
+        );
+        assert_eq!(
+            offset_of!(SetupPreset, superkey),
+            104 + MAP_SYMBOL_SIZE + HDR_BACKUP_SIZE
         );
     }
 
@@ -363,13 +488,19 @@ mod tests {
 
     #[test]
     fn version_pack_matches_u32() {
-        assert_eq!(pack_version(0, 13, 1), 0x0d01);
-        let v = VersionT {
-            reserved: 0,
-            patch: 1,
-            minor: 13,
-            major: 0,
-        };
-        assert_eq!(v.as_u32(), 0x0d01);
+        assert_eq!(pack_version(0, 13, 2), 0x0d02);
+        assert_eq!(KP_VERSION_U32, 0x0d02);
+        let v = VersionT::new(0, 13, 2);
+        assert_eq!(v.as_u32(), 0x0d02);
+    }
+
+    #[test]
+    fn map_symbol_type_constants() {
+        assert_eq!(MAP_SYM_NONE, 0);
+        assert_eq!(MAP_SYM_MEMBLOCK_PHYS_ALLOC_TRY_NID, 1);
+        assert_eq!(MAP_SYM_MEMBLOCK_ALLOC_TRY_NID, 2);
+        assert_eq!(MAP_SYM_MEMBLOCK_FIND_IN_RANGE, 3);
+        assert_eq!(MAP_SYM_MEMBLOCK_VIRT_ALLOC_TRY_NID, 1);
+        assert_eq!(MAP_SYM_MEMBLOCK_VIRT_ALLOC_FROM_ALLOC_TRY_NID, 2);
     }
 }

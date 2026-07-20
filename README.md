@@ -1,7 +1,7 @@
 # kptools-rs
 
 Pure-Rust port of the `tools/` directory from
-[bmax121/KernelPatch](https://github.com/bmax121/KernelPatch) v0.13.1.
+[bmax121/KernelPatch](https://github.com/bmax121/KernelPatch) v0.13.2.
 
 The upstream `kptools` patches an arm64 kernel image with a
 `kpimg` (KernelPatch kernel-mode image) + optional KPM extras,

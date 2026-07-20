@@ -1,4 +1,4 @@
-//! Pure-Rust port of the `tools/` half of KernelPatch 0.13.1.
+//! Pure-Rust port of the `tools/` half of KernelPatch 0.13.2.
 //!
 //! Scope: every CLI the upstream `kptools` binary exposes, plus the
 //! in-process library entry points an embedded caller needs. The
@@ -6,9 +6,9 @@
 //! kptools only *produces* the patched kernel, it does not replace
 //! the kernel-mode kpimg.
 //!
-//! Upstream is pinned to tag 0.13.1. Any version bump on the kernel
-//! side invalidates the preset layout; the parser aborts hard when
-//! it sees a mismatched `setup_header_t.kp_version`.
+//! Upstream is pinned to tag 0.13.2. The tools port only accepts a
+//! matching `setup_header_t.kp_version` (`0x0d02`); a mismatched kpimg
+//! fails with `Error::BadKpimg` before any output is written.
 
 #![deny(unsafe_op_in_unsafe_fn)]
 

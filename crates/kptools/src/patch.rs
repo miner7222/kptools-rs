@@ -1,39 +1,32 @@
 //! Kernel-image patch driver.
 //!
-//! Port of upstream `tools/patch.{c,h}`. Wraps the kallsym + symbol
-//! + image + preset + insn modules into the four commands the
-//! binary exposes:
-//!
-//! - [`patch_update_img`] — full `-p` path. Reads a kernel image +
-//!   kpimg + optional KPM `.kpm` extras, emits a patched kernel.
-//! - [`unpatch_img`] — `-u`. Reverts a previously patched kernel
-//!   by restoring the `header_backup` bytes and truncating to the
-//!   original size recorded in the preset.
-//! - [`reset_key`] — `-r`. Overwrites the superkey in a patched
-//!   kernel without touching anything else.
-//! - [`parse_image_patch_info`] / [`print_image_patch_info`] —
-//!   introspection for the `-l` list command.
+//! Port of upstream `tools/patch.{c,h}`. Wraps the kallsym, symbol,
+//! image, preset, and insn modules into the four commands the binary
+//! exposes: [`patch_update_img`] (`-p`), [`unpatch_img`] (`-u`),
+//! [`reset_key`] (`-r`), and [`parse_image_patch_info`] /
+//! [`print_image_patch_info`] (`-l`).
 
 use sha2::Digest;
 
 use kptools_base::{
-    Error, Result, io::{read_file, read_file_align, write_file},
-    logi, logw,
+    io::{read_file, read_file_align, write_file},
+    logi, logw, Error, Result,
 };
 
-use crate::image::{KernelInfo, get_kernel_info};
+use crate::image::{get_kernel_info, KernelInfo};
 use crate::insn::{relo_branch_func, write_b};
 use crate::kallsym::{
-    Kallsym, analyze_kallsym_info, find_linux_banner, ArchType,
+    analyze_kallsym_info, find_ikconfig_blob, find_linux_banner, ArchType, Kallsym,
 };
-use crate::kpm::{get_kpm_info, KpmInfo};
+use crate::kpm::get_kpm_info;
 use crate::preset::{
-    ADDITIONAL_LEN, EXTRA_ALIGN, EXTRA_EVENT_LEN, EXTRA_HDR_MAGIC, EXTRA_ITEM_MAX_NUM,
-    EXTRA_NAME_LEN, ExtraType, KP_MAGIC, MAGIC_LEN, PATCH_EXTRA_ITEM_LEN, PatchExtraItem, Preset,
-    ROOT_SUPER_KEY_HASH_LEN, SUPER_KEY_LEN,
+    ExtraType, PatchExtraItem, Preset, ADDITIONAL_LEN, EXTRA_ALIGN, EXTRA_EVENT_LEN,
+    EXTRA_HDR_MAGIC, EXTRA_ITEM_MAX_NUM, EXTRA_NAME_LEN, KP_MAGIC, KP_VERSION_U32, MAGIC_LEN,
+    PATCH_EXTRA_ITEM_LEN, ROOT_SUPER_KEY_HASH_LEN, SUPER_KEY_LEN,
 };
 use crate::symbol::{
-    fillin_map_symbol, fillin_patch_config, get_symbol_offset_exit, select_map_area,
+    fillin_map_symbol, fillin_patch_config, get_symbol_offset_exit, get_usable_symbol_offset_try,
+    select_map_area, select_symbol_lookup_anchor_offset,
 };
 
 pub const INFO_KERNEL_IMG_SESSION: &str = "[kernel]";
@@ -96,7 +89,10 @@ impl KernelFile {
         let mut kfile = Vec::with_capacity(old.img_offset + new_kimg_len);
         kfile.extend_from_slice(&old.kfile[..old.img_offset]);
         kfile.resize(old.img_offset + new_kimg_len, 0);
-        Self { kfile, img_offset: old.img_offset }
+        Self {
+            kfile,
+            img_offset: old.img_offset,
+        }
     }
 
     /// Update the `UNCOMPRESSED_IMG` length header (when present)
@@ -154,7 +150,7 @@ impl ExtraConfig {
             .unwrap_or_default()
             .to_string();
         let inferred_name = if ty == ExtraType::Kpm {
-            let info = get_kpm_info(&data).unwrap_or(KpmInfo::default());
+            let info = get_kpm_info(&data).unwrap_or_default();
             info.name.clone().unwrap_or(name_hint.clone())
         } else {
             name_hint
@@ -168,7 +164,16 @@ impl ExtraConfig {
             extra_type: ty.as_i32(),
             name: [0; EXTRA_NAME_LEN],
             event: [0; EXTRA_EVENT_LEN],
-            pad: [0; PATCH_EXTRA_ITEM_LEN - 4 - 4 - 4 - 4 - 4 - EXTRA_NAME_LEN - EXTRA_EVENT_LEN],
+            flags: 0,
+            pad: [0; PATCH_EXTRA_ITEM_LEN
+                - 4
+                - 4
+                - 4
+                - 4
+                - 4
+                - EXTRA_NAME_LEN
+                - EXTRA_EVENT_LEN
+                - 4],
         };
         item.magic.copy_from_slice(EXTRA_HDR_MAGIC);
         copy_cstr_into(&mut item.name, inferred_name.as_bytes());
@@ -210,10 +215,11 @@ pub struct PatchedKimg {
 }
 
 pub fn parse_image_patch_info(kimg: &[u8]) -> Result<PatchedKimg> {
-    let mut out = PatchedKimg::default();
-    out.kimg_len = kimg.len();
-
-    out.kinfo = get_kernel_info(kimg)?;
+    let mut out = PatchedKimg {
+        kimg_len: kimg.len(),
+        kinfo: get_kernel_info(kimg)?,
+        ..Default::default()
+    };
 
     let banner_prefix = b"Linux version ";
     let mut pos = 0usize;
@@ -223,10 +229,7 @@ pub fn parse_image_patch_info(kimg: &[u8]) -> Result<PatchedKimg> {
     {
         let banner_start = pos + rel;
         let after = banner_start + banner_prefix.len();
-        if after + 1 < kimg.len()
-            && kimg[after].is_ascii_digit()
-            && kimg[after + 1] == b'.'
-        {
+        if after + 1 < kimg.len() && kimg[after].is_ascii_digit() && kimg[after + 1] == b'.' {
             out.banner = Some(banner_start);
             break;
         }
@@ -255,9 +258,7 @@ pub fn parse_image_patch_info(kimg: &[u8]) -> Result<PatchedKimg> {
             align_kimg_len = align;
             break;
         }
-        logw!(
-            "found magic at 0x{preset_off:x} but saved kernel size mismatch, ignoring"
-        );
+        logw!("found magic at 0x{preset_off:x} but saved kernel size mismatch, ignoring");
         search_from = preset_off + 1;
     }
 
@@ -282,8 +283,7 @@ pub fn parse_image_patch_info(kimg: &[u8]) -> Result<PatchedKimg> {
     let mut p = extra_start;
     let end = extra_start + extra_size;
     while p + PATCH_EXTRA_ITEM_LEN <= end.min(kimg.len()) {
-        let item: &PatchExtraItem =
-            bytemuck::from_bytes(&kimg[p..p + PATCH_EXTRA_ITEM_LEN]);
+        let item: &PatchExtraItem = bytemuck::from_bytes(&kimg[p..p + PATCH_EXTRA_ITEM_LEN]);
         if item.magic != *EXTRA_HDR_MAGIC {
             break;
         }
@@ -299,7 +299,23 @@ pub fn parse_image_patch_info(kimg: &[u8]) -> Result<PatchedKimg> {
 }
 
 fn align_ceil_i32(v: i32, a: i32) -> i32 {
-    if a == 0 { v } else { ((v + a - 1) / a) * a }
+    if a == 0 {
+        v
+    } else {
+        ((v + a - 1) / a) * a
+    }
+}
+
+/// Pure kpimg version gate used by `patch_update_img` before any
+/// output is written. Only the on-disk ABI this port is built
+/// against (`KP_VERSION_U32` / 0.13.2 / `0x0d02`) is accepted.
+pub fn ensure_supported_kpimg_version(ver_num: u32) -> Result<()> {
+    if ver_num != KP_VERSION_U32 {
+        return Err(Error::bad_kpimg(format!(
+            "unsupported kpimg version 0x{ver_num:x}; this tools port only supports 0x{KP_VERSION_U32:x}"
+        )));
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -322,7 +338,9 @@ pub struct PatchArgs<'a> {
 pub fn patch_update_img(mut args: PatchArgs<'_>) -> Result<()> {
     kptools_base::log::set_log_enable(true);
 
-    if args.superkey.is_empty() {
+    // Upstream 0.13.2 allows empty superkey when root_key mode is
+    // selected (`-S` with no value, or CLI defaulting root_skey).
+    if args.superkey.is_empty() && !args.root_key {
         return Err(Error::invalid_arg("empty superkey"));
     }
 
@@ -336,16 +354,24 @@ pub fn patch_update_img(mut args: PatchArgs<'_>) -> Result<()> {
     let mut kallsym_buf = kernel_file.kimg().to_vec();
     let mut kallsym = Kallsym::default();
     let ver = find_linux_banner(&mut kallsym, &kallsym_buf)?;
-    if ver > 0x6_07_00 {
+    // Upstream packs version as (major<<16)|(minor<<8)|patch and
+    // treats kernels >= 5.10 as GKI for map-area selection.
+    let is_gki = ver >= 330_240; // 5.10.0
+    logi!("is_gki: {}", if is_gki { "true" } else { "false" });
+    if ver > 395_008 {
         // Linux 6.7+ — disable the PI_MAP guard inside the kernel
         // image itself so the kpimg entry can overwrite the map
         // area. Upstream applies the same hex patch against the
         // live kernel_file.kimg (not the kallsym copy).
+        //
+        // 0.13.2 inverted the success sense of `disable_pi_map`:
+        // non-zero return (hex not found) logs "already patched
+        // or not found"; zero return means the patch landed.
         let kimg = kernel_file.kimg_mut();
-        if disable_pi_map(kimg).is_ok() {
-            logi!("disabled PI_MAP for kernel version > 6.12.23");
+        if disable_pi_map(kimg).is_err() {
+            logi!("kernel have patched or not found");
         } else {
-            logi!("kernel already patched or PI_MAP not found");
+            logi!("disabled PI_MAP for kernel version > 6.12.23");
         }
     }
 
@@ -354,6 +380,19 @@ pub fn patch_update_img(mut args: PatchArgs<'_>) -> Result<()> {
     let pimg = parse_image_patch_info(kernel_file.kimg())?;
     let kinfo = pimg.kinfo;
     let ori_kimg_len = pimg.ori_kimg_len;
+
+    // Locate the kernel's own IKCONFIG gzip blob; runtime puff
+    // inflates it. Failure is non-fatal (kconfig fields stay 0).
+    let (kcfg_start, kcfg_bytes, kcfg_ok) = match find_ikconfig_blob(&kallsym_buf) {
+        Ok((start, size)) => {
+            logi!("ikconfig gzip blob at 0x{start:x}, size 0x{size:x} (runtime puff)");
+            (start as i64, size as i64, true)
+        }
+        Err(rc) => {
+            logw!("kernel IKCONFIG blob not found (rc={rc}), kconfig unavailable at runtime");
+            (0, 0, false)
+        }
+    };
 
     // Restore original bytes if the image was previously patched
     // (so we're working from the clean kernel).
@@ -393,9 +432,7 @@ pub fn patch_update_img(mut args: PatchArgs<'_>) -> Result<()> {
     let mut start_offset = align_kernel_size;
     if out_all_len > start_offset {
         start_offset = align_ceil_i32(out_all_len as i32, SZ_4K as i32) as usize;
-        logi!(
-            "patch overlap, move start 0x{align_kernel_size:x} -> 0x{start_offset:x}"
-        );
+        logi!("patch overlap, move start 0x{align_kernel_size:x} -> 0x{start_offset:x}");
     }
     logi!(
         "layout kimg: 0,0x{ori_kimg_len:x}, kpimg: 0x{align_kimg_len:x},0x{out_img_len:x}, extra: 0x{out_img_len:x},0x{out_all_len:x}, start: 0x{start_offset:x}"
@@ -433,6 +470,11 @@ pub fn patch_update_img(mut args: PatchArgs<'_>) -> Result<()> {
         p.header
     };
     let ver_num = existing_header.kp_version.as_u32();
+    // Explicit supported-kpimg version gate. 0.13.2 rearranged
+    // map_symbol + setup preserve fields; parsing another layout
+    // would silently corrupt superkey / map alloc types. This runs
+    // before any setup rewrite / output write.
+    ensure_supported_kpimg_version(ver_num)?;
     let compile_time = existing_header.compile_time;
     let config_flags = existing_header.config_flags;
     let is_android = config_flags & crate::preset::CONFIG_ANDROID != 0;
@@ -441,8 +483,10 @@ pub fn patch_update_img(mut args: PatchArgs<'_>) -> Result<()> {
     logi!(
         "kpimg compile time: {}",
         std::str::from_utf8(
-            &compile_time
-                [..compile_time.iter().position(|&b| b == 0).unwrap_or(compile_time.len())]
+            &compile_time[..compile_time
+                .iter()
+                .position(|&b| b == 0)
+                .unwrap_or(compile_time.len())]
         )
         .unwrap_or("<non-utf8>")
     );
@@ -453,8 +497,7 @@ pub fn patch_update_img(mut args: PatchArgs<'_>) -> Result<()> {
     );
 
     // Build setup block.
-    let mut new_preset: Preset =
-        *bytemuck::from_bytes(&out_kf.kimg()[preset_off..preset_end]);
+    let mut new_preset: Preset = *bytemuck::from_bytes(&out_kf.kimg()[preset_off..preset_end]);
     new_preset.setup = bytemuck::Zeroable::zeroed();
     new_preset.setup.kernel_version = crate::preset::VersionT {
         reserved: 0,
@@ -470,18 +513,19 @@ pub fn patch_update_img(mut args: PatchArgs<'_>) -> Result<()> {
     new_preset.setup.start_offset = start_offset as i64;
     new_preset.setup.extra_size = extra_size as i64;
 
-    let (map_start, map_max_size) = select_map_area(&kallsym, &mut kallsym_buf)?;
+    let (map_start, map_max_size) =
+        select_map_area(&kallsym, &mut kallsym_buf, ori_kimg_len as i32, is_gki)?;
     new_preset.setup.map_offset = map_start as i64;
     new_preset.setup.map_max_size = map_max_size as i64;
     logi!("map_start: 0x{map_start:x}, max_size: 0x{map_max_size:x}");
 
     // Sync NOP modifications from select_map_area back into the
-    // output image.
-    let tcp_init_sock_off = get_symbol_offset_exit(&kallsym, &kallsym_buf, "tcp_init_sock")? as usize;
-    let sync_start = tcp_init_sock_off;
+    // output image. 0.13.2 syncs from `map_start`, not the raw
+    // tcp_init_sock symbol (which may not be the selected anchor).
+    let sync_start = map_start as usize;
     let mut sync_size = (map_max_size * 2) as usize;
     if sync_start + sync_size > ori_kimg_len {
-        sync_size = ori_kimg_len - sync_start;
+        sync_size = ori_kimg_len.saturating_sub(sync_start);
     }
     if sync_size > 0 {
         out_kf.kimg_mut()[sync_start..sync_start + sync_size]
@@ -489,8 +533,27 @@ pub fn patch_update_img(mut args: PatchArgs<'_>) -> Result<()> {
         logi!("synced NOP modifications offset: 0x{sync_start:x}, size: 0x{sync_size:x}");
     }
 
+    let imglen = ori_kimg_len as i32;
+    new_preset.setup.sprintf_offset =
+        get_usable_symbol_offset_try(&kallsym, &kallsym_buf, imglen, "sprintf") as i64;
+    let (anchor_off, anchor_name) =
+        select_symbol_lookup_anchor_offset(&kallsym, &kallsym_buf, imglen);
+    new_preset.setup.symbol_lookup_anchor_offset = anchor_off as i64;
     new_preset.setup.kallsyms_lookup_name_offset =
-        get_symbol_offset_exit(&kallsym, &kallsym_buf, "kallsyms_lookup_name")? as i64;
+        get_usable_symbol_offset_try(&kallsym, &kallsym_buf, imglen, "kallsyms_lookup_name") as i64;
+    if new_preset.setup.symbol_lookup_anchor_offset != 0 && new_preset.setup.sprintf_offset != 0 {
+        let name = anchor_name.unwrap_or("<unknown>");
+        logi!(
+            "prefer runtime forward scan anchor for kallsyms_lookup_name: {name}, offset: 0x{anchor_off:08x}"
+        );
+    } else if new_preset.setup.kallsyms_lookup_name_offset != 0 {
+        logi!("fallback to direct kallsyms_lookup_name symbol");
+    } else {
+        return Err(Error::kallsym(
+            "no usable symbol scan anchor/sprintf chain and no kallsyms_lookup_name symbol",
+        ));
+    }
+
     let mut printk_off = crate::kallsym::get_symbol_offset_zero(&kallsym, &kallsym_buf, "printk");
     if printk_off == 0 {
         printk_off = crate::kallsym::get_symbol_offset_zero(&kallsym, &kallsym_buf, "_printk");
@@ -502,27 +565,37 @@ pub fn patch_update_img(mut args: PatchArgs<'_>) -> Result<()> {
 
     // map_symbol + patch_config
     new_preset.setup.map_symbol = fillin_map_symbol(&kallsym, &kallsym_buf)?;
-    new_preset.setup.header_backup.copy_from_slice(&kallsym_buf[..8]);
+    new_preset
+        .setup
+        .header_backup
+        .copy_from_slice(&kallsym_buf[..8]);
     new_preset.setup.patch_config =
-        fillin_patch_config(&kallsym, &kallsym_buf, is_android)?;
+        fillin_patch_config(&kallsym, &kallsym_buf, imglen, is_android)?;
 
-    // superkey
+    // superkey / root_superkey
     if !args.root_key {
         copy_cstr_into(&mut new_preset.setup.superkey, args.superkey.as_bytes());
         logi!("superkey: {}", args.superkey);
-    } else {
+    } else if !args.superkey.is_empty() {
         let hash = sha2::Sha256::digest(args.superkey.as_bytes());
         let len = ROOT_SUPER_KEY_HASH_LEN.min(hash.len());
         new_preset.setup.root_superkey[..len].copy_from_slice(&hash[..len]);
         let hex: String = hash[..len].iter().map(|b| format!("{b:02x}")).collect();
         logi!("root superkey hash: {hex}");
+    } else {
+        new_preset.setup.root_superkey = [0; ROOT_SUPER_KEY_HASH_LEN];
+        logi!("root_key mode with empty superkey: root_superkey zeroed");
+    }
+
+    // Record IKCONFIG gzip blob location for runtime puff inflation.
+    if kcfg_ok {
+        new_preset.setup.kconfig_offset = kcfg_start;
+        new_preset.setup.kconfig_size = kcfg_bytes;
     }
 
     // paging_init entry
-    let paging_init =
-        get_symbol_offset_exit(&kallsym, &kallsym_buf, "paging_init")?;
-    new_preset.setup.paging_init_offset =
-        relo_branch_func(&kallsym_buf, paging_init) as i64;
+    let paging_init = get_symbol_offset_exit(&kallsym, &kallsym_buf, "paging_init")?;
+    new_preset.setup.paging_init_offset = relo_branch_func(&kallsym_buf, paging_init) as i64;
 
     // additional `KEY=VALUE` list — length-prefixed packing.
     let mut pos_in_additional = 0usize;
@@ -589,7 +662,8 @@ pub fn patch_update_img(mut args: PatchArgs<'_>) -> Result<()> {
         extra_type: 0,
         name: [0; EXTRA_NAME_LEN],
         event: [0; EXTRA_EVENT_LEN],
-        pad: [0; PATCH_EXTRA_ITEM_LEN - 4 - 4 - 4 - 4 - 4 - EXTRA_NAME_LEN - EXTRA_EVENT_LEN],
+        flags: 0,
+        pad: [0; PATCH_EXTRA_ITEM_LEN - 4 - 4 - 4 - 4 - 4 - EXTRA_NAME_LEN - EXTRA_EVENT_LEN - 4],
     };
     out_kf.kimg_mut()[cursor..cursor + PATCH_EXTRA_ITEM_LEN]
         .copy_from_slice(bytemuck::bytes_of(&empty));
@@ -631,7 +705,10 @@ fn from_hex(c: u8) -> u8 {
 fn hex_patch(img: &mut [u8], pattern_hex: &str, replace_hex: &str) -> Result<()> {
     let pattern = hexstr_to_bytes(pattern_hex);
     let replace = hexstr_to_bytes(replace_hex);
-    let Some(pos) = img.windows(pattern.len()).position(|w| w == pattern.as_slice()) else {
+    let Some(pos) = img
+        .windows(pattern.len())
+        .position(|w| w == pattern.as_slice())
+    else {
         return Err(Error::bad_kernel("hex pattern not found"));
     };
     img[pos..pos + replace.len()].copy_from_slice(&replace);
@@ -639,11 +716,7 @@ fn hex_patch(img: &mut [u8], pattern_hex: &str, replace_hex: &str) -> Result<()>
 }
 
 fn disable_pi_map(img: &mut [u8]) -> Result<()> {
-    hex_patch(
-        img,
-        "E60316AAE7031F2A3411889A",
-        "E60316AAE7031F2AF40309AA",
-    )
+    hex_patch(img, "E60316AAE7031F2A3411889A", "E60316AAE7031F2AF40309AA")
 }
 
 // ---------------------------------------------------------------------------
@@ -684,7 +757,9 @@ pub fn reset_key(
         return Err(Error::bad_preset("not patched kernel image"));
     };
     let mut preset: Preset = *read_preset(kernel_file.kimg(), preset_off);
-    let origin = std::str::from_utf8(&preset.setup.superkey).unwrap_or("?").to_string();
+    let origin = std::str::from_utf8(&preset.setup.superkey)
+        .unwrap_or("?")
+        .to_string();
     preset.setup.superkey = [0; SUPER_KEY_LEN];
     copy_cstr_into(&mut preset.setup.superkey, superkey.as_bytes());
     let end = preset_off + core::mem::size_of::<Preset>();
@@ -733,7 +808,10 @@ pub fn print_preset_info(preset: &Preset) {
     println!("superkey={}", cstr_trim(&preset.setup.superkey));
 
     if ver_num > 0xa04 {
-        println!("root_superkey={}", bytes_to_hex(&preset.setup.root_superkey));
+        println!(
+            "root_superkey={}",
+            bytes_to_hex(&preset.setup.root_superkey)
+        );
     }
 
     println!("{INFO_ADDITIONAL_SESSION}");
@@ -794,7 +872,11 @@ pub fn print_image_patch_info(pimg: &PatchedKimg, kimg: &[u8]) -> Result<()> {
     }
     println!(
         "patched={}",
-        if pimg.preset_offset.is_some() { "true" } else { "false" }
+        if pimg.preset_offset.is_some() {
+            "true"
+        } else {
+            "false"
+        }
     );
 
     let Some(preset_off) = pimg.preset_offset else {
@@ -832,6 +914,8 @@ pub fn print_image_patch_info(pimg: &PatchedKimg, kimg: &[u8]) -> Result<()> {
         };
         println!("args={args}");
         println!("con_size=0x{con_size:x}");
+        let flags = item.flags;
+        println!("flags=0x{flags:x}");
         let con_off = args_off + args_size as usize;
         if ty == ExtraType::Kpm {
             let con_end = con_off + con_size as usize;
@@ -877,5 +961,38 @@ mod tests {
     fn align_ceil_helper() {
         assert_eq!(align_ceil_i32(0x1000, 0x1000), 0x1000);
         assert_eq!(align_ceil_i32(0x1001, 0x1000), 0x2000);
+    }
+
+    #[test]
+    fn supported_kpimg_version_is_0_13_2() {
+        assert_eq!(KP_VERSION_U32, 0x0d02);
+    }
+
+    #[test]
+    fn ensure_supported_kpimg_version_accepts_0_13_2() {
+        ensure_supported_kpimg_version(0x0d02).unwrap();
+        ensure_supported_kpimg_version(KP_VERSION_U32).unwrap();
+    }
+
+    #[test]
+    fn ensure_supported_kpimg_version_rejects_mismatched_layouts() {
+        for bad in [0x0d01_u32, 0x0d03, 0x0a04, 0] {
+            let err = ensure_supported_kpimg_version(bad).unwrap_err();
+            match err {
+                Error::BadKpimg(msg) => {
+                    assert!(msg.contains("unsupported kpimg version"), "{msg}");
+                    assert!(msg.contains(&format!("0x{bad:x}")), "{msg}");
+                }
+                other => panic!("expected BadKpimg, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn gki_threshold_matches_upstream() {
+        // 5.10.0 packed as (5<<16)|(10<<8)|0
+        assert_eq!(330_240, (5 << 16) | (10 << 8));
+        // 6.7.0 packed as (6<<16)|(7<<8)|0
+        assert_eq!(395_008, (6 << 16) | (7 << 8));
     }
 }
