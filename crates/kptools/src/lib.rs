@@ -1,14 +1,8 @@
-//! Pure-Rust port of the `tools/` half of KernelPatch 0.13.2.
+//! Pure-Rust port of the userspace `tools/` half of KernelPatch 0.13.4.
 //!
-//! Scope: every CLI the upstream `kptools` binary exposes, plus the
-//! in-process library entry points an embedded caller needs. The
-//! kernel-side (`kernel/`, `kpms/`, `user/`) is out of scope —
-//! kptools only *produces* the patched kernel, it does not replace
-//! the kernel-mode kpimg.
-//!
-//! Upstream is pinned to tag 0.13.2. The tools port only accepts a
-//! matching `setup_header_t.kp_version` (`0x0d02`); a mismatched kpimg
-//! fails with `Error::BadKpimg` before any output is written.
+//! The crate keeps the on-disk preset ABI and CLI behavior aligned with
+//! upstream while supporting both arm64 raw kernel images and x86_64
+//! bzImages.
 
 #![deny(unsafe_op_in_unsafe_fn)]
 
@@ -21,13 +15,7 @@ pub mod kpm;
 pub mod patch;
 pub mod preset;
 pub mod symbol;
+pub mod x86_64;
 
-pub use kptools_base::{Error, Result};
-
-/// Re-export of the `kptools-base` logging toggle. Library embedders
-/// need this to flip logging on explicitly — `LOG_ENABLE` defaults to
-/// `false` so that non-CLI callers don't get the `[+]` / `[?]` / `[-]`
-/// chatter on stderr without asking for it. The binary target flips it
-/// to `true` in its own `main()`; every other caller has to call
-/// `kptools::log::set_log_enable(true)` themselves.
 pub use kptools_base::log;
+pub use kptools_base::{Error, Result};
