@@ -1,13 +1,4 @@
-//! CLI dispatcher.
-//!
-//! Hand-rolled getopt-style parser so the binary ingests every
-//! argv shape upstream's `kptools.c` accepts without pulling in a
-//! full clap/argh surface. The short-form boot-image commands
-//! (`unpack` / `repack` / `sha1`) share this entry too, but only
-//! the patch + dump subset is wired in this slice — the `unpack` /
-//! `repack` / `sha1` sub-paths land with the bootimg codec port
-//! (that work is split out into its own follow-up because it drags
-//! lz4 / xz / bzip2 deps that the kernel-patch path does not need).
+//! CLI dispatcher compatible with KernelPatch kptools 0.13.4.
 
 use std::path::PathBuf;
 
@@ -26,8 +17,29 @@ pub fn main(argv: Vec<String>) -> Result<i32> {
         return Ok(1);
     }
 
-    // Short-form first-arg commands — these skip getopt parsing
-    // and take positional args directly.
+    if argv.len() > 3 {
+        match argv[1].as_str() {
+            "unpack-bzimage" => {
+                kptools_base::log::set_log_enable(true);
+                let image = crate::x86_64::load_x86_bzimage(std::path::Path::new(&argv[2]))?;
+                kptools_base::io::write_file(std::path::Path::new(&argv[3]), &image.flat)?;
+                kptools_base::logi!(
+                    "x86 flat kernel written: {}, size: 0x{:x}",
+                    argv[3],
+                    image.flat.len()
+                );
+                return Ok(0);
+            }
+            "repack-bzimage" => {
+                kptools_base::log::set_log_enable(true);
+                let mut image = crate::x86_64::load_x86_bzimage(std::path::Path::new(&argv[2]))?;
+                crate::x86_64::write_x86_bzimage(&mut image, std::path::Path::new(&argv[3]))?;
+                return Ok(0);
+            }
+            _ => {}
+        }
+    }
+
     if argv.len() > 2 {
         match argv[1].as_str() {
             "unpack" => {
@@ -71,21 +83,18 @@ pub fn main(argv: Vec<String>) -> Result<i32> {
         }
     }
 
-    // getopt-style flags. We only need the subset kptools actually
-    // reads; anything else is printed as an error.
     let mut cmd: Option<char> = None;
     let mut kimg: Option<PathBuf> = None;
     let mut kpimg: Option<PathBuf> = None;
     let mut out: Option<PathBuf> = None;
     let mut superkey: Option<String> = None;
     let mut root_skey = false;
-    let mut additional: Vec<String> = Vec::new();
-    let mut extras: Vec<ExtraConfig> = Vec::new();
+    let mut additional = Vec::new();
+    let mut extras = Vec::new();
 
     let mut i = 1usize;
     while i < argv.len() {
-        let a = &argv[i];
-        match a.as_str() {
+        match argv[i].as_str() {
             "-h" | "--help" => {
                 cmd = Some('h');
                 i += 1;
@@ -119,41 +128,39 @@ pub fn main(argv: Vec<String>) -> Result<i32> {
                 i += 1;
             }
             "-i" | "--image" => {
-                kimg = Some(argv[i + 1].clone().into());
+                kimg = Some(next_arg(&argv, i)?.into());
                 i += 2;
             }
             "-k" | "--kpimg" => {
-                kpimg = Some(argv[i + 1].clone().into());
+                kpimg = Some(next_arg(&argv, i)?.into());
                 i += 2;
             }
             "-o" | "--out" => {
-                out = Some(argv[i + 1].clone().into());
+                out = Some(next_arg(&argv, i)?.into());
                 i += 2;
             }
             "-s" | "--skey" => {
-                superkey = Some(argv[i + 1].clone());
+                superkey = Some(next_arg(&argv, i)?.to_string());
                 i += 2;
             }
             "-S" | "--root-skey" => {
-                superkey = Some(argv[i + 1].clone());
+                superkey = Some(next_arg(&argv, i)?.to_string());
                 root_skey = true;
                 i += 2;
             }
             "-a" | "--addition" => {
-                additional.push(argv[i + 1].clone());
+                additional.push(next_arg(&argv, i)?.to_string());
                 i += 2;
             }
             "-M" | "--embed-extra-path" => {
-                let p = PathBuf::from(&argv[i + 1]);
-                // Default to KPM for now; `-T` overrides.
-                let cfg = ExtraConfig::from_path(&p, ExtraType::Kpm)?;
-                extras.push(cfg);
+                let p = PathBuf::from(next_arg(&argv, i)?);
+                extras.push(ExtraConfig::from_path(&p, ExtraType::Kpm)?);
                 i += 2;
             }
             "-T" | "--extra-type" => {
-                let ty = ExtraType::from_str_tag(&argv[i + 1]).ok_or_else(|| {
-                    Error::invalid_arg(format!("invalid extra type: {}", argv[i + 1]))
-                })?;
+                let value = next_arg(&argv, i)?;
+                let ty = ExtraType::from_str_tag(value)
+                    .ok_or_else(|| Error::invalid_arg(format!("invalid extra type: {value}")))?;
                 if let Some(last) = extras.last_mut() {
                     last.extra_type = ty;
                     last.item.extra_type = ty.as_i32();
@@ -162,24 +169,24 @@ pub fn main(argv: Vec<String>) -> Result<i32> {
             }
             "-N" | "--extra-name" => {
                 if let Some(last) = extras.last_mut() {
-                    last.set_name = Some(argv[i + 1].clone());
+                    last.set_name = Some(next_arg(&argv, i)?.to_string());
                 }
                 i += 2;
             }
             "-V" | "--extra-event" => {
                 if let Some(last) = extras.last_mut() {
-                    last.set_event = Some(argv[i + 1].clone());
+                    last.set_event = Some(next_arg(&argv, i)?.to_string());
                 }
                 i += 2;
             }
             "-A" | "--extra-args" => {
                 if let Some(last) = extras.last_mut() {
-                    last.set_args = Some(argv[i + 1].clone());
+                    last.set_args = Some(next_arg(&argv, i)?.to_string());
                 }
                 i += 2;
             }
-            _ => {
-                eprintln!("unknown flag: {a}");
+            other => {
+                eprintln!("unknown flag: {other}");
                 return Ok(1);
             }
         }
@@ -198,8 +205,6 @@ pub fn main(argv: Vec<String>) -> Result<i32> {
             let kimg = kimg.ok_or_else(|| Error::invalid_arg("missing -i"))?;
             let kpimg = kpimg.ok_or_else(|| Error::invalid_arg("missing -k"))?;
             let out = out.ok_or_else(|| Error::invalid_arg("missing -o"))?;
-            // 0.13.2: if neither -s nor -S supplied, fall back to root-key
-            // mode with an empty superkey (upstream `if (!superkey) root_skey = true`).
             let (skey, root) = match superkey {
                 Some(s) => (s, root_skey),
                 None => (String::new(), true),
@@ -230,63 +235,48 @@ pub fn main(argv: Vec<String>) -> Result<i32> {
         }
         Some('d') => {
             let kimg = kimg.ok_or_else(|| Error::invalid_arg("missing -i"))?;
-            kptools_base::log::set_log_enable(true);
-            let kf = crate::patch::KernelFile::read(&kimg)?;
-            let mut kallsym = crate::kallsym::Kallsym::default();
-            let mut buf = kf.kimg().to_vec();
-            crate::kallsym::find_linux_banner(&mut kallsym, &buf)?;
-            crate::kallsym::analyze_kallsym_info(
-                &mut kallsym,
-                &mut buf,
-                crate::kallsym::ArchType::Arm64,
-                true,
-            )?;
-            crate::kallsym::dump_all_symbols(&kallsym, &buf);
+            patch::dump_kallsym_path(&kimg)?;
             Ok(0)
         }
         Some('f') => {
             let kimg = kimg.ok_or_else(|| Error::invalid_arg("missing -i"))?;
-            kptools_base::log::set_log_enable(true);
-            let kf = crate::patch::KernelFile::read(&kimg)?;
-            crate::kallsym::dump_all_ikconfig(kf.kimg())?;
+            patch::dump_ikconfig_path(&kimg)?;
             Ok(0)
         }
         Some('l') => {
             if let Some(kimg) = kimg {
-                crate::patch::print_image_patch_info_path(&kimg)?;
+                patch::print_image_patch_info_path(&kimg)?;
                 return Ok(0);
             }
-            // If no -i, check -M (first extra with a path).
             if let Some(cfg) = extras.first() {
-                if cfg.is_path {
-                    // `ExtraConfig::from_path` already read the
-                    // file; invoke the kpm printer via a re-read so
-                    // we match upstream's "path" flow exactly.
-                    if cfg.extra_type == ExtraType::Kpm {
-                        // Use first KPM data already loaded.
-                        let info = crate::kpm::get_kpm_info(&cfg.data)?;
-                        println!("{}", crate::kpm::INFO_EXTRA_KPM_SESSION);
-                        println!("name={}", info.name.as_deref().unwrap_or(""));
-                        println!("version={}", info.version.as_deref().unwrap_or(""));
-                        println!("license={}", info.license.as_deref().unwrap_or(""));
-                        println!("author={}", info.author.as_deref().unwrap_or(""));
-                        println!("description={}", info.description.as_deref().unwrap_or(""));
-                        return Ok(0);
-                    }
+                if cfg.is_path && cfg.extra_type == ExtraType::Kpm {
+                    let info = crate::kpm::get_kpm_info(&cfg.data)?;
+                    println!("{}", crate::kpm::INFO_EXTRA_KPM_SESSION);
+                    println!("name={}", info.name.as_deref().unwrap_or(""));
+                    println!("version={}", info.version.as_deref().unwrap_or(""));
+                    println!("license={}", info.license.as_deref().unwrap_or(""));
+                    println!("author={}", info.author.as_deref().unwrap_or(""));
+                    println!("description={}", info.description.as_deref().unwrap_or(""));
+                    return Ok(0);
                 }
             }
             if let Some(kpimg) = kpimg {
-                crate::patch::print_kp_image_info_path(&kpimg)?;
+                patch::print_kp_image_info_path(&kpimg)?;
                 return Ok(0);
             }
-            Err(Error::invalid_arg("missing -i / -M / -k for -l"))?;
-            Ok(1)
+            Err(Error::invalid_arg("missing -i / -M / -k for -l"))
         }
         _ => {
             print_usage(&argv);
             Ok(1)
         }
     }
+}
+
+fn next_arg(argv: &[String], i: usize) -> Result<&str> {
+    argv.get(i + 1)
+        .map(String::as_str)
+        .ok_or_else(|| Error::invalid_arg(format!("missing value after {}", argv[i])))
 }
 
 fn print_usage(argv: &[String]) {
@@ -302,9 +292,11 @@ COMMAND:\n\
   -p, --patch                      Patch kernel image with a kpimg + superkey.\n\
   -u, --unpatch                    Unpatch a previously-patched image.\n\
   -r, --resetkey                   Reset the superkey of a patched image.\n\
-  -d, --dump                       Dump kallsyms table of a kernel image.\n\
+  -d, --dump                       Dump kallsyms table of arm64 or x86_64 kernel image.\n\
   -f, --flag                       Dump in-kernel CONFIG (IKCFG) if embedded.\n\
   -l, --list                       Print kpimg/KPM/kernel image info.\n\
+  unpack-bzimage <bzImage> <kernel> Unpack an x86 bzImage to a flat kernel.\n\
+  repack-bzimage <bzImage> <output> Repack an x86 bzImage payload.\n\
 \n\
 Options:\n\
   -i, --image PATH                 Kernel image path.\n\
@@ -312,7 +304,7 @@ Options:\n\
   -s, --skey KEY                   Set the superkey directly.\n\
   -S, --root-skey KEY              Set the root-superkey via SHA-256.\n\
   -o, --out PATH                   Patched image path.\n\
-  -a  --addition KEY=VALUE         Add a key=value line to the addition block.\n\
+  -a, --addition KEY=VALUE         Add a key=value line to the addition block.\n\
   -M, --embed-extra-path PATH      Embed a KPM (.kpm file).\n\
   -T, --extra-type TYPE            Type of the previous -M entry.\n\
   -N, --extra-name NAME            Name override.\n\

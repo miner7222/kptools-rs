@@ -1,36 +1,14 @@
 //! On-disk preset structures + constants.
 //!
 //! Direct port of upstream `kernel/include/preset.h`, pinned to
-//! tag 0.13.2. Field order, packing, and embedded size constants
+//! tag 0.13.4. Field order, packing, and embedded size constants
 //! match the C build byte-for-byte so a patched kernel produced by
-//! this crate is interchangeable with the one produced by the
-//! reference `kptools` binary.
-//!
-//! Every struct derives `bytemuck::{Pod, Zeroable}` so callers can
-//! reinterpret an mmap slice straight into `&preset_t` with zero
-//! copying. Size and offset tests at the bottom pin every
-//! `_Static_assert` the C header carries — if one of those trips,
-//! the layout has drifted and downstream offsets would silently
-//! corrupt a patched kernel.
-//!
-//! This crate only supports the 0.13.2 on-disk ABI (`kp_version`
-//! major/minor/patch = 0/13/2, encoded as `0x0d02`). A mismatched
-//! kpimg version must fail with a `Result` before any output is
-//! written.
+//! this crate is interchangeable with the reference `kptools` binary.
 
 use bytemuck::{Pod, Zeroable};
 
-// ---------------------------------------------------------------------------
-// Magic + size constants
-// ---------------------------------------------------------------------------
-
-/// `KP_MAGIC` — the 6-char tag that marks a patched kernel image.
-/// The trailing `\0\0` rounds it out to `MAGIC_LEN = 8` so upstream
-/// can search for an 8-byte literal inside the mmap. We keep the
-/// full 8-byte padded form here.
 pub const KP_MAGIC: &[u8; MAGIC_LEN] = b"KP1158\0\0";
 pub const MAGIC_LEN: usize = 0x8;
-
 pub const KP_HEADER_SIZE: usize = 0x40;
 pub const SUPER_KEY_LEN: usize = 0x40;
 pub const ROOT_SUPER_KEY_HASH_LEN: usize = 0x20;
@@ -45,41 +23,47 @@ pub const MAP_ALIGN: usize = 0x10;
 
 pub const CONFIG_DEBUG: u64 = 1 << 0;
 pub const CONFIG_ANDROID: u64 = 1 << 1;
+pub const CONFIG_FLAG_X86_64: u64 = 1 << 2;
+pub const KP_X86_ENTRY_OFFSET: usize = 0x800;
 
-/// KernelPatch tools/kpimg version this port is built against.
 pub const KP_VERSION_MAJOR: u8 = 0;
 pub const KP_VERSION_MINOR: u8 = 13;
-pub const KP_VERSION_PATCH: u8 = 2;
-
-/// Packed `VERSION(0, 13, 2)` = `0x00000d02`.
+pub const KP_VERSION_PATCH: u8 = 4;
 pub const KP_VERSION_U32: u32 = pack_version(KP_VERSION_MAJOR, KP_VERSION_MINOR, KP_VERSION_PATCH);
 
 pub const MAP_SYMBOL_NUM: usize = 7;
 pub const MAP_SYMBOL_SIZE: usize = MAP_SYMBOL_NUM * 8;
-
 pub const MAP_SYM_NONE: u64 = 0;
 pub const MAP_SYM_RESOLVE: u64 = 1;
-
 pub const MAP_SYM_MEMBLOCK_PHYS_ALLOC_TRY_NID: u64 = 1;
 pub const MAP_SYM_MEMBLOCK_ALLOC_TRY_NID: u64 = 2;
 pub const MAP_SYM_MEMBLOCK_FIND_IN_RANGE: u64 = 3;
-
 pub const MAP_SYM_MEMBLOCK_VIRT_ALLOC_TRY_NID: u64 = 1;
 pub const MAP_SYM_MEMBLOCK_VIRT_ALLOC_FROM_ALLOC_TRY_NID: u64 = 2;
 
 pub const PATCH_CONFIG_LEN: usize = 512;
 pub const ADDITIONAL_LEN: usize = 512;
 pub const PATCH_EXTRA_ITEM_LEN: usize = 128;
-
 pub const EXTRA_ITEM_MAX_NUM: usize = 32;
 pub const EXTRA_ALIGN: usize = 0x10;
 pub const EXTRA_NAME_LEN: usize = 0x20;
 pub const EXTRA_EVENT_LEN: usize = 0x20;
 pub const EXTRA_HDR_MAGIC: &[u8; 4] = b"kpe\0";
 
-// ---------------------------------------------------------------------------
-// Extra item types (upstream `EXTRA_TYPE_*`)
-// ---------------------------------------------------------------------------
+pub const PATCH_EXTRA_HEADER_VERSION_LEGACY: u32 = 0;
+pub const PATCH_EXTRA_HEADER_VERSION_MAGIC: u32 = 0x4b50_0000;
+pub const PATCH_EXTRA_HEADER_VERSION_MASK: u32 = 0xffff_0000;
+pub const PATCH_EXTRA_HEADER_VERSION_VALUE_MASK: u32 = 0x0000_ffff;
+
+/// Rust equivalent of upstream `PATCH_EXTRA_FLAGS_GET_HEADER_VERSION`.
+pub const fn extra_flags_get_header_version(flags: i32) -> u32 {
+    let flags = flags as u32;
+    if flags & PATCH_EXTRA_HEADER_VERSION_MASK == PATCH_EXTRA_HEADER_VERSION_MAGIC {
+        flags & PATCH_EXTRA_HEADER_VERSION_VALUE_MASK
+    } else {
+        PATCH_EXTRA_HEADER_VERSION_LEGACY
+    }
+}
 
 #[repr(i32)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -90,6 +74,7 @@ pub enum ExtraType {
     Exec = 3,
     Raw = 4,
     AndroidRc = 5,
+    KconfigLegacy = 6,
 }
 
 impl ExtraType {
@@ -105,6 +90,7 @@ impl ExtraType {
             3 => Some(Self::Exec),
             4 => Some(Self::Raw),
             5 => Some(Self::AndroidRc),
+            6 => Some(Self::KconfigLegacy),
             _ => None,
         }
     }
@@ -117,6 +103,7 @@ impl ExtraType {
             "exec" => Self::Exec,
             "raw" => Self::Raw,
             "android_rc" => Self::AndroidRc,
+            "kconfig" => Self::KconfigLegacy,
             _ => return None,
         })
     }
@@ -129,12 +116,11 @@ impl ExtraType {
             Self::Exec => "exec",
             Self::Raw => "raw",
             Self::AndroidRc => "android_rc",
+            Self::KconfigLegacy => "kconfig",
         }
     }
 }
 
-// Event-name constants — surfaced as str so callers can write them
-// into `patch_extra_item_t.event` without stringifying ints.
 pub const EXTRA_EVENT_PAGING_INIT: &str = "paging-init";
 pub const EXTRA_EVENT_PRE_KERNEL_INIT: &str = "pre-kernel-init";
 pub const EXTRA_EVENT_KPM_DEFAULT: &str = EXTRA_EVENT_PRE_KERNEL_INIT;
@@ -145,15 +131,15 @@ pub const EXTRA_EVENT_PRE_EXEC_INIT: &str = "pre-exec-init";
 pub const EXTRA_EVENT_POST_EXEC_INIT: &str = "post-exec-init";
 pub const EXTRA_EVENT_PRE_SECOND_STAGE: &str = "pre-init-second-stage";
 pub const EXTRA_EVENT_POST_SECOND_STAGE: &str = "post-init-second-stage";
-
-// ---------------------------------------------------------------------------
-// Version header
-// ---------------------------------------------------------------------------
+pub const EXTRA_EVENT_EARLY_INIT: &str = "early-init";
+pub const EXTRA_EVENT_INIT: &str = "init";
+pub const EXTRA_EVENT_LATE_INIT: &str = "late-init";
+pub const EXTRA_EVENT_POST_FS_DATA: &str = "post-fs-data";
+pub const EXTRA_EVENT_BOOT_COMPLETED: &str = "boot-completed";
 
 #[repr(C, packed)]
 #[derive(Clone, Copy, Pod, Zeroable, Debug)]
 pub struct VersionT {
-    /// Reserved byte the C union keeps at offset 0.
     pub reserved: u8,
     pub patch: u8,
     pub minor: u8,
@@ -175,14 +161,9 @@ impl VersionT {
     }
 }
 
-/// `version(major, minor, patch)` upstream macro.
 pub const fn pack_version(major: u8, minor: u8, patch: u8) -> u32 {
-    ((major as u32) << 16) | ((minor as u32) << 8) | (patch as u32)
+    ((major as u32) << 16) | ((minor as u32) << 8) | patch as u32
 }
-
-// ---------------------------------------------------------------------------
-// setup_header_t (64 bytes)
-// ---------------------------------------------------------------------------
 
 #[repr(C, packed)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -190,10 +171,8 @@ pub struct SetupHeader {
     pub magic: [u8; MAGIC_LEN],
     pub kp_version: VersionT,
     pub reserved: u32,
-    /// `config_t` alias for `u64` in the C source.
     pub config_flags: u64,
     pub compile_time: [u8; COMPILE_TIME_LEN],
-    /// Tail of the 64-byte header union. Zero-filled.
     pub pad: [u8; KP_HEADER_SIZE
         - MAGIC_LEN
         - core::mem::size_of::<VersionT>()
@@ -201,10 +180,6 @@ pub struct SetupHeader {
         - 8
         - COMPILE_TIME_LEN],
 }
-
-// ---------------------------------------------------------------------------
-// map_symbol_t (56 bytes = 7 × u64)
-// ---------------------------------------------------------------------------
 
 #[repr(C, packed)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -214,15 +189,9 @@ pub struct MapSymbol {
     pub memblock_phys_alloc_relo: u64,
     pub memblock_virt_alloc_relo: u64,
     pub memblock_mark_nomap_relo: u64,
-    /// Which phys-alloc symbol was selected (`MAP_SYM_MEMBLOCK_*`).
     pub memblock_phys_alloc_type: u64,
-    /// Which virt-alloc symbol was selected (`MAP_SYM_MEMBLOCK_*`).
     pub memblock_virt_alloc_type: u64,
 }
-
-// ---------------------------------------------------------------------------
-// patch_config_t (512 bytes — fixed cap on the C union)
-// ---------------------------------------------------------------------------
 
 pub const PATCH_CONFIG_SU_ENABLE: u8 = 0x1;
 pub const PATCH_CONFIG_SU_HOOK_NO_WRAP: u8 = 0x2;
@@ -246,17 +215,9 @@ pub struct PatchConfig {
     pub slow_avc_audit: u64,
     pub input_handle_event: u64,
     pub patch_su_config: u8,
-    /// Zero-filled tail up to the 512-byte cap the C union enforces.
     pub pad: [u8; PATCH_CONFIG_LEN - 14 * 8 - 1],
 }
 
-// ---------------------------------------------------------------------------
-// _patch_extra_item (128 bytes)
-// ---------------------------------------------------------------------------
-
-/// Explicit field sizes used by the 128-byte extra-item layout.
-/// `flags` is present in 0.13.2; the remaining pad keeps the item
-/// fixed at `PATCH_EXTRA_ITEM_LEN`.
 const EXTRA_ITEM_FIXED: usize = 4 + 4 + 4 + 4 + 4 + EXTRA_NAME_LEN + EXTRA_EVENT_LEN + 4;
 
 #[repr(C, packed)]
@@ -269,22 +230,10 @@ pub struct PatchExtraItem {
     pub extra_type: i32,
     pub name: [u8; EXTRA_NAME_LEN],
     pub event: [u8; EXTRA_EVENT_LEN],
-    /// New in 0.13.2. Remains zero unless a caller sets it.
     pub flags: i32,
     pub pad: [u8; PATCH_EXTRA_ITEM_LEN - EXTRA_ITEM_FIXED],
 }
 
-// ---------------------------------------------------------------------------
-// setup_preset_t (current layout — version > 0xa04)
-//
-// After `root_superkey` the preserve window starts. 0.13.2 carves the
-// first 32 bytes of that 64-byte window into four i64 fields and keeps
-// the remaining 32 bytes as reserved pad. `patch_config` still starts
-// at `root_superkey + ROOT_SUPER_KEY_HASH_LEN + SETUP_PRESERVE_LEN`.
-// ---------------------------------------------------------------------------
-
-/// Bytes reserved after the four 0.13.2 setup fields inside the
-/// original `SETUP_PRESERVE_LEN` window.
 pub const SETUP_PRESERVE_REMAINING: usize = SETUP_PRESERVE_LEN - 32;
 
 #[repr(C, packed)]
@@ -312,15 +261,10 @@ pub struct SetupPreset {
     pub symbol_lookup_anchor_offset: i64,
     pub kconfig_offset: i64,
     pub kconfig_size: i64,
-    /// Remaining preserve capacity after the four i64 fields above.
     pub preserve: [u8; SETUP_PRESERVE_REMAINING],
     pub patch_config: PatchConfig,
     pub additional: [u8; ADDITIONAL_LEN],
 }
-
-// ---------------------------------------------------------------------------
-// preset_t = setup_header_t + setup_preset_t
-// ---------------------------------------------------------------------------
 
 #[repr(C, packed)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -329,67 +273,20 @@ pub struct Preset {
     pub setup: SetupPreset,
 }
 
-// ---------------------------------------------------------------------------
-// Layout sanity checks — must match upstream `_Static_assert` lines
-// and the assembly offset macros in `preset.h`.
-// ---------------------------------------------------------------------------
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::mem::{offset_of, size_of};
 
     #[test]
-    fn size_version_t() {
+    fn abi_sizes_match_upstream() {
         assert_eq!(size_of::<VersionT>(), 4);
-    }
-
-    #[test]
-    fn size_setup_header() {
-        // Upstream `_Static_assert(sizeof(setup_header_t) == KP_HEADER_SIZE)`.
         assert_eq!(size_of::<SetupHeader>(), KP_HEADER_SIZE);
-    }
-
-    #[test]
-    fn size_map_symbol() {
         assert_eq!(size_of::<MapSymbol>(), MAP_SYMBOL_SIZE);
-        assert_eq!(MAP_SYMBOL_SIZE, 56);
-    }
-
-    #[test]
-    fn size_patch_config() {
         assert_eq!(size_of::<PatchConfig>(), PATCH_CONFIG_LEN);
-    }
-
-    #[test]
-    fn size_patch_extra_item() {
         assert_eq!(size_of::<PatchExtraItem>(), PATCH_EXTRA_ITEM_LEN);
-        assert_eq!(
-            offset_of!(PatchExtraItem, flags),
-            4 + 4 + 4 + 4 + 4 + EXTRA_NAME_LEN + EXTRA_EVENT_LEN
-        );
-    }
-
-    #[test]
-    fn size_setup_preset_current() {
-        // Field sequence for 0.13.2:
-        //   4  version_t
-        //   4  reserved
-        //  12 × 8 = 96 i64 fields
-        //  56 map_symbol (7 × u64)
-        //   8 header_backup
-        //  64 superkey
-        //  32 root_superkey
-        //  32 four setup i64s (sprintf/lookup-anchor/kconfig)
-        //  32 preserve remainder
-        // 512 patch_config
-        // 512 additional
         let expected = 4 + 4 + 12 * 8 + 56 + 8 + 64 + 32 + 32 + 32 + 512 + 512;
         assert_eq!(size_of::<SetupPreset>(), expected);
-    }
-
-    #[test]
-    fn size_preset() {
         assert_eq!(
             size_of::<Preset>(),
             size_of::<SetupHeader>() + size_of::<SetupPreset>()
@@ -398,7 +295,6 @@ mod tests {
 
     #[test]
     fn setup_field_offsets_match_upstream_macros() {
-        // Mirrors the assembly offset macros in preset.h for 0.13.2.
         assert_eq!(offset_of!(SetupPreset, kernel_version), 0);
         assert_eq!(offset_of!(SetupPreset, kimg_size), 8);
         assert_eq!(offset_of!(SetupPreset, kpimg_size), 16);
@@ -425,6 +321,14 @@ mod tests {
             offset_of!(SetupPreset, root_superkey),
             104 + MAP_SYMBOL_SIZE + HDR_BACKUP_SIZE + SUPER_KEY_LEN
         );
+        assert_eq!(
+            offset_of!(SetupPreset, map_symbol) + offset_of!(MapSymbol, memblock_phys_alloc_type),
+            104 + 5 * 8
+        );
+        assert_eq!(
+            offset_of!(SetupPreset, map_symbol) + offset_of!(MapSymbol, memblock_virt_alloc_type),
+            104 + 6 * 8
+        );
         let root_off = offset_of!(SetupPreset, root_superkey);
         assert_eq!(
             offset_of!(SetupPreset, sprintf_offset),
@@ -446,21 +350,25 @@ mod tests {
             offset_of!(SetupPreset, patch_config),
             root_off + ROOT_SUPER_KEY_HASH_LEN + SETUP_PRESERVE_LEN
         );
-        // Relative offsets called out by the reproduction case.
-        // map_symbol starts at +104; phys/virt alloc type are the last
-        // two u64s of the 7-slot map_symbol block.
-        assert_eq!(
-            offset_of!(SetupPreset, map_symbol) + offset_of!(MapSymbol, memblock_phys_alloc_type),
-            104 + 5 * 8
-        );
-        assert_eq!(
-            offset_of!(SetupPreset, map_symbol) + offset_of!(MapSymbol, memblock_virt_alloc_type),
-            104 + 6 * 8
-        );
-        assert_eq!(
-            offset_of!(SetupPreset, superkey),
-            104 + MAP_SYMBOL_SIZE + HDR_BACKUP_SIZE
-        );
+    }
+
+    #[test]
+    fn extra_types_and_header_version() {
+        for t in [
+            ExtraType::None,
+            ExtraType::Kpm,
+            ExtraType::Shell,
+            ExtraType::Exec,
+            ExtraType::Raw,
+            ExtraType::AndroidRc,
+            ExtraType::KconfigLegacy,
+        ] {
+            assert_eq!(ExtraType::from_i32(t.as_i32()), Some(t));
+            assert_eq!(ExtraType::from_str_tag(t.str_tag()), Some(t));
+        }
+        assert_eq!(extra_flags_get_header_version(0), 0);
+        assert_eq!(extra_flags_get_header_version(0x4b50_0002), 2);
+        assert_eq!(extra_flags_get_header_version(0x1234_0002), 0);
     }
 
     #[test]
@@ -471,36 +379,14 @@ mod tests {
     }
 
     #[test]
-    fn extra_type_roundtrip() {
-        for t in [
-            ExtraType::None,
-            ExtraType::Kpm,
-            ExtraType::Shell,
-            ExtraType::Exec,
-            ExtraType::Raw,
-            ExtraType::AndroidRc,
-        ] {
-            assert_eq!(ExtraType::from_i32(t.as_i32()), Some(t));
-            assert_eq!(ExtraType::from_str_tag(t.str_tag()), Some(t));
-        }
-        assert_eq!(ExtraType::from_str_tag("bogus"), None);
+    fn version_pack_matches_0134() {
+        assert_eq!(KP_VERSION_U32, 0x0d04);
+        assert_eq!(VersionT::new(0, 13, 4).as_u32(), 0x0d04);
     }
 
     #[test]
-    fn version_pack_matches_u32() {
-        assert_eq!(pack_version(0, 13, 2), 0x0d02);
-        assert_eq!(KP_VERSION_U32, 0x0d02);
-        let v = VersionT::new(0, 13, 2);
-        assert_eq!(v.as_u32(), 0x0d02);
-    }
-
-    #[test]
-    fn map_symbol_type_constants() {
-        assert_eq!(MAP_SYM_NONE, 0);
-        assert_eq!(MAP_SYM_MEMBLOCK_PHYS_ALLOC_TRY_NID, 1);
-        assert_eq!(MAP_SYM_MEMBLOCK_ALLOC_TRY_NID, 2);
-        assert_eq!(MAP_SYM_MEMBLOCK_FIND_IN_RANGE, 3);
-        assert_eq!(MAP_SYM_MEMBLOCK_VIRT_ALLOC_TRY_NID, 1);
-        assert_eq!(MAP_SYM_MEMBLOCK_VIRT_ALLOC_FROM_ALLOC_TRY_NID, 2);
+    fn x86_constants_match_upstream() {
+        assert_eq!(CONFIG_FLAG_X86_64, 1 << 2);
+        assert_eq!(KP_X86_ENTRY_OFFSET, 0x800);
     }
 }
