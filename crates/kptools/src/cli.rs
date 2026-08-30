@@ -1,4 +1,4 @@
-//! CLI dispatcher compatible with KernelPatch kptools 0.13.4.
+//! CLI dispatcher compatible with KernelPatch kptools 0.13.8.
 
 use std::path::PathBuf;
 
@@ -209,15 +209,29 @@ pub fn main(argv: Vec<String>) -> Result<i32> {
                 Some(s) => (s, root_skey),
                 None => (String::new(), true),
             };
-            patch::patch_update_img(PatchArgs {
-                kimg_path: &kimg,
-                kpimg_path: &kpimg,
-                out_path: &out,
-                superkey: &skey,
-                root_key: root,
-                additional,
-                extras,
-            })?;
+            if crate::bootimg::is_bootimg(&kimg) {
+                kptools_base::log::set_log_enable(true);
+                kptools_base::logi!("detected Android boot image, patching kernel in place");
+                crate::bootimg::patch_bootimg(
+                    &kimg,
+                    &kpimg,
+                    &out,
+                    &skey,
+                    root,
+                    &additional,
+                    extras,
+                )?;
+            } else {
+                patch::patch_update_img(PatchArgs {
+                    kimg_path: &kimg,
+                    kpimg_path: &kpimg,
+                    out_path: &out,
+                    superkey: &skey,
+                    root_key: root,
+                    additional,
+                    extras,
+                })?;
+            }
             Ok(0)
         }
         Some('u') => {
@@ -282,34 +296,39 @@ fn next_arg(argv: &[String], i: usize) -> Result<&str> {
 fn print_usage(argv: &[String]) {
     let prog = argv.first().map(|s| s.as_str()).unwrap_or("kptools");
     eprintln!(
-        "Kernel Image Patch Tools. version: {:x}\n\
-\n\
-Usage: {prog} COMMAND [Options...]\n\
-\n\
-COMMAND:\n\
-  -h, --help                       Print this message.\n\
-  -v, --version                    Print version number.\n\
-  -p, --patch                      Patch kernel image with a kpimg + superkey.\n\
-  -u, --unpatch                    Unpatch a previously-patched image.\n\
-  -r, --resetkey                   Reset the superkey of a patched image.\n\
-  -d, --dump                       Dump kallsyms table of arm64 or x86_64 kernel image.\n\
-  -f, --flag                       Dump in-kernel CONFIG (IKCFG) if embedded.\n\
-  -l, --list                       Print kpimg/KPM/kernel image info.\n\
-  unpack-bzimage <bzImage> <kernel> Unpack an x86 bzImage to a flat kernel.\n\
-  repack-bzimage <bzImage> <output> Repack an x86 bzImage payload.\n\
-\n\
-Options:\n\
-  -i, --image PATH                 Kernel image path.\n\
-  -k, --kpimg PATH                 KernelPatch image path.\n\
-  -s, --skey KEY                   Set the superkey directly.\n\
-  -S, --root-skey KEY              Set the root-superkey via SHA-256.\n\
-  -o, --out PATH                   Patched image path.\n\
-  -a, --addition KEY=VALUE         Add a key=value line to the addition block.\n\
-  -M, --embed-extra-path PATH      Embed a KPM (.kpm file).\n\
-  -T, --extra-type TYPE            Type of the previous -M entry.\n\
-  -N, --extra-name NAME            Name override.\n\
-  -V, --extra-event EVENT          Trigger event.\n\
-  -A, --extra-args ARGS            Arguments.\n",
-        version_u32()
+        concat!(
+            "Kernel Image Patch Tools. version: {:x}\n",
+            "\n",
+            "Usage: {} COMMAND [Options...]\n",
+            "\n",
+            "COMMAND:\n",
+            "  -h, --help                       Print this message.\n",
+            "  -v, --version                    Print version number.\n",
+            "  -p, --patch                      Patch kernel image with a kpimg + superkey.\n",
+            "                                   If -i is an Android boot image (ANDROID! magic), the kernel is extracted,\n",
+            "                                   patched and the boot image is repacked automatically in one step.\n",
+            "  -u, --unpatch                    Unpatch a previously-patched image.\n",
+            "  -r, --resetkey                   Reset the superkey of a patched image.\n",
+            "  -d, --dump                       Dump kallsyms table of arm64 or x86_64 kernel image.\n",
+            "  -f, --flag                       Dump in-kernel CONFIG (IKCFG) if embedded.\n",
+            "  -l, --list                       Print kpimg/KPM/kernel image info.\n",
+            "  unpack-bzimage <bzImage> <kernel> Unpack an x86 bzImage to a flat kernel.\n",
+            "  repack-bzimage <bzImage> <output> Repack an x86 bzImage payload.\n",
+            "\n",
+            "Options:\n",
+            "  -i, --image PATH                 Kernel image path.\n",
+            "  -k, --kpimg PATH                 KernelPatch image path.\n",
+            "  -s, --skey KEY                   Set the superkey directly.\n",
+            "  -S, --root-skey KEY              Set the root-superkey via SHA-256.\n",
+            "  -o, --out PATH                   Patched image path.\n",
+            "  -a, --addition KEY=VALUE         Add a key=value line to the addition block.\n",
+            "  -M, --embed-extra-path PATH      Embed a KPM (.kpm file).\n",
+            "  -T, --extra-type TYPE            Type of the previous -M entry.\n",
+            "  -N, --extra-name NAME            Name override.\n",
+            "  -V, --extra-event EVENT          Trigger event.\n",
+            "  -A, --extra-args ARGS            Arguments.\n",
+        ),
+        version_u32(),
+        prog
     );
 }

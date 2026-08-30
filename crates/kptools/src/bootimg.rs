@@ -272,15 +272,6 @@ fn decompress_xz_to(data: &[u8], out_path: &Path) -> Result<()> {
     write_file(out_path, &buf)
 }
 
-fn compress_xz(data: &[u8]) -> Result<Vec<u8>> {
-    use lzma_rust2::{CheckType, XzOptions, XzWriter};
-    let mut opt = XzOptions::with_preset(9);
-    opt.set_check_sum_type(CheckType::Crc32);
-    let mut enc = XzWriter::new(Vec::new(), opt).map_err(|e| Error::compress(e.to_string()))?;
-    enc.write_all(data).map_err(Error::Io)?;
-    enc.finish().map_err(|e| Error::compress(e.to_string()))
-}
-
 fn decompress_lzma_to(data: &[u8], out_path: &Path) -> Result<()> {
     use lzma_rust2::LzmaReader;
     let mut dec = LzmaReader::new_mem_limit(data, u32::MAX, None)
@@ -291,15 +282,6 @@ fn decompress_lzma_to(data: &[u8], out_path: &Path) -> Result<()> {
     write_file(out_path, &buf)
 }
 
-fn compress_lzma(data: &[u8]) -> Result<Vec<u8>> {
-    use lzma_rust2::{LzmaOptions, LzmaWriter};
-    let opt = LzmaOptions::with_preset(9);
-    let mut enc = LzmaWriter::new_use_header(Vec::new(), &opt, None)
-        .map_err(|e| Error::compress(e.to_string()))?;
-    enc.write_all(data).map_err(Error::Io)?;
-    enc.finish().map_err(|e| Error::compress(e.to_string()))
-}
-
 fn decompress_zstd_to(data: &[u8], out_path: &Path) -> Result<()> {
     let mut dec =
         zstd::stream::read::Decoder::new(data).map_err(|e| Error::decompress(e.to_string()))?;
@@ -307,10 +289,6 @@ fn decompress_zstd_to(data: &[u8], out_path: &Path) -> Result<()> {
     dec.read_to_end(&mut buf)
         .map_err(|e| Error::decompress(e.to_string()))?;
     write_file(out_path, &buf)
-}
-
-fn compress_zstd(data: &[u8]) -> Result<Vec<u8>> {
-    zstd::stream::encode_all(data, 22).map_err(|e| Error::compress(e.to_string()))
 }
 
 // ---------------------------------------------------------------------------
@@ -361,6 +339,96 @@ pub fn auto_depress(data: &[u8], out_path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// In-memory analogue of upstream `auto_depress_to_mem`, used by the
+/// one-step Android boot-image patch path.
+pub fn auto_depress_to_mem(data: &[u8]) -> Result<Vec<u8>> {
+    if data.len() < 4 {
+        return Err(Error::decompress("auto_depress_to_mem: data too small"));
+    }
+    let method = detect_compress_method(&data[..4]);
+    logi!("Auto-detect compression method: {method}");
+    let mut out = Vec::with_capacity(64 * 1024 * 1024);
+    match method {
+        1 => {
+            use flate2::read::GzDecoder;
+            logi!("Detected GZIP compressed kernel.");
+            GzDecoder::new(data)
+                .read_to_end(&mut out)
+                .map_err(|e| Error::decompress(e.to_string()))?;
+            logi!("Decompressed: {} bytes", out.len());
+        }
+        2 => {
+            logi!("Detected LZ4 Frame. Decompressing with lz4frame...");
+            lz4::Decoder::new(data)
+                .map_err(|e| Error::decompress(e.to_string()))?
+                .read_to_end(&mut out)
+                .map_err(|e| Error::decompress(e.to_string()))?;
+            logi!("Decompressed: {} bytes", out.len());
+        }
+        3 => {
+            logi!("Probing LZ4 Legacy (block-based)...");
+            if u32::from_le_bytes(data[..4].try_into().unwrap()) != LZ4_MAGIC {
+                return Err(Error::decompress("lz4 legacy: bad magic"));
+            }
+            let mut pos = 4usize;
+            while pos + 4 <= data.len() {
+                let block_size =
+                    u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
+                pos += 4;
+                if block_size == 0 {
+                    break;
+                }
+                if pos + block_size > data.len() {
+                    return Err(Error::decompress("lz4 legacy: truncated block"));
+                }
+                let decoded =
+                    lz4_flex::block::decompress(&data[pos..pos + block_size], LZ4_BLOCK_SIZE)
+                        .map_err(|e| Error::decompress(format!("lz4 block: {e}")))?;
+                out.extend_from_slice(&decoded);
+                pos += block_size;
+            }
+            if out.is_empty() {
+                logi!("Not LZ4 block format, fallback.");
+                out.extend_from_slice(data);
+            } else {
+                logi!("LZ4 block decompressed: {} bytes", out.len());
+            }
+        }
+        5 => {
+            use bzip2::read::BzDecoder;
+            logi!("Detected BZIP2. Decompressing...");
+            BzDecoder::new(data)
+                .read_to_end(&mut out)
+                .map_err(|e| Error::decompress(e.to_string()))?;
+            logi!("BZIP2 Decompressed: {} bytes", out.len());
+        }
+        6 => {
+            use lzma_rust2::XzReader;
+            logi!("Detected XZ format. Decompressing...");
+            XzReader::new(data, true)
+                .read_to_end(&mut out)
+                .map_err(|e| Error::decompress(e.to_string()))?;
+            logi!("XZ Decompressed: {} bytes", out.len());
+        }
+        7 => {
+            use lzma_rust2::LzmaReader;
+            logi!("Detected Legacy LZMA format. Decompressing...");
+            LzmaReader::new_mem_limit(data, u32::MAX, None)
+                .map_err(|e| Error::decompress(e.to_string()))?
+                .read_to_end(&mut out)
+                .map_err(|e| Error::decompress(e.to_string()))?;
+            logi!("LZMA Decompressed: {} bytes", out.len());
+        }
+        _ => {
+            // Upstream's in-memory path treats zstd (currently unsupported
+            // there) and all unknown formats as a raw kernel.
+            logi!("Treating as Raw Kernel (or unknown format).");
+            out.extend_from_slice(data);
+        }
+    }
+    Ok(out)
+}
+
 // ---------------------------------------------------------------------------
 // extract_kernel
 // ---------------------------------------------------------------------------
@@ -406,6 +474,14 @@ pub fn extract_kernel(bootimg_path: &Path, out_path: &Path) -> Result<()> {
     let kernel_data = &data[start..end];
     auto_depress(kernel_data, out_path)?;
     Ok(())
+}
+
+pub fn is_bootimg(path: &Path) -> bool {
+    let Ok(mut file) = File::open(path) else {
+        return false;
+    };
+    let mut magic = [0u8; 8];
+    file.read_exact(&mut magic).is_ok() && magic == *BOOT_MAGIC
 }
 
 // ---------------------------------------------------------------------------
@@ -455,14 +531,20 @@ fn align_up(v: u32, a: u32) -> u32 {
     }
 }
 
-/// Port of upstream `repack_bootimg`. Pulls the new kernel from
-/// disk, recompresses it in the same format as the original (or
-/// GZIP when the original was XZ / LZMA — upstream's fallback),
-/// rebuilds the header's `kernel_size`, refreshes the id digest,
-/// and patches the AVB footer `data_size` field.
 pub fn repack_bootimg(
     orig_boot_path: &Path,
     new_kernel_path: &Path,
+    out_boot_path: &Path,
+) -> Result<()> {
+    let raw_k = kptools_base::io::read_file(new_kernel_path)?;
+    repack_bootimg_mem(orig_boot_path, &raw_k, out_boot_path)
+}
+
+/// In-memory analogue of upstream `repack_bootimg_mem`. Recompresses the
+/// supplied raw kernel using the source boot image's kernel compression.
+pub fn repack_bootimg_mem(
+    orig_boot_path: &Path,
+    new_kernel: &[u8],
     out_boot_path: &Path,
 ) -> Result<()> {
     logi!("Starting automatic repack...");
@@ -476,7 +558,7 @@ pub fn repack_bootimg(
     if hdr.magic != *BOOT_MAGIC {
         return Err(Error::bad_bootimg("not an ANDROID! boot image"));
     }
-    let total_size = data.len();
+    let mut total_size = data.len();
     let avb_size_of = core::mem::size_of::<AvbFooter>();
     let mut avb: AvbFooter = *bytemuck::from_bytes(&data[total_size - avb_size_of..]);
 
@@ -514,41 +596,37 @@ pub fn repack_bootimg(
         }
     }
 
-    let raw_k = kptools_base::io::read_file(new_kernel_path)?;
-    let _raw_k_size = raw_k.len();
+    let raw_k = new_kernel;
 
     // Recompress to match the source method. XZ / LZMA fall back
     // to GZIP (upstream behaviour).
     let (final_k, final_method) = match method {
         1 => {
             logi!("Compressing new kernel with GZIP...");
-            (compress_gzip(&raw_k)?, 1)
+            (compress_gzip(raw_k)?, 1)
         }
         2 => {
             logi!("Compressing new kernel with LZ4...");
-            (compress_lz4_frame(&raw_k)?, 2)
+            (compress_lz4_frame(raw_k)?, 2)
         }
         3 => {
             logi!("Compressing new kernel with LZ4 Legacy...");
-            (compress_lz4_legacy(&raw_k)?, 3)
+            (compress_lz4_legacy(raw_k)?, 3)
         }
         4 => {
-            logi!("Compressing new kernel with ZSTD level 22...");
-            (compress_zstd(&raw_k)?, 4)
+            return Err(Error::compress(
+                "kernel uses zstd, repacking is not supported",
+            ));
         }
         5 => {
             logi!("Compressing new kernel with BZIP2 level 9...");
-            (compress_bzip2(&raw_k)?, 5)
+            (compress_bzip2(raw_k)?, 5)
         }
-        6 => {
-            logi!("Compressing new kernel with XZ level 9 (CRC32)...");
-            (compress_xz(&raw_k)?, 6)
+        6 | 7 => {
+            logi!("Original was XZ/LZMA. Repacking as GZIP for compatibility...");
+            (compress_gzip(raw_k)?, 1)
         }
-        7 => {
-            logi!("Compressing new kernel with Legacy LZMA level 9...");
-            (compress_lzma(&raw_k)?, 7)
-        }
-        _ => (raw_k.clone(), 0),
+        _ => (raw_k.to_vec(), 0),
     };
     let _ = final_method;
     let final_k_size = final_k.len() as u32;
@@ -561,30 +639,33 @@ pub fn repack_bootimg(
     hdr.kernel_size = final_k_size + dtb_size;
     let mut checksum_aligned = align_up(fmt_size, page_size);
 
-    // Upstream copies `rest_data_size - sizeof(avb)` bytes from the
-    // source right after the kernel, then trims trailing zeros. The
-    // AVB footer is written separately at the end.
+    // Upstream zero-initializes the whole tail, copies everything except the
+    // separately-held AVB footer, and scans only the copied range for the last
+    // non-zero byte.
     let mut rest_buf: Vec<u8> = Vec::new();
     if rest_data_size > 0 {
-        let end_minus_avb = total_size - avb_size_of;
-        let raw_rest = &data[rest_data_offset..end_minus_avb];
-        let rest_data_size_no_avb = raw_rest.len();
-        let mut tail_off = rest_data_size_no_avb;
-        while tail_off > 0 && raw_rest[tail_off - 1] == 0 {
+        let copied_size = rest_data_size.saturating_sub(avb_size_of);
+        let copied_end = rest_data_offset
+            .checked_add(copied_size)
+            .ok_or_else(|| Error::bad_bootimg("rest data range overflow"))?;
+        if copied_end > data.len() {
+            return Err(Error::bad_bootimg("rest data past file end"));
+        }
+        let mut rest_buf_tmp = vec![0u8; rest_data_size];
+        rest_buf_tmp[..copied_size].copy_from_slice(&data[rest_data_offset..copied_end]);
+        let mut tail_off = copied_size;
+        while tail_off > 0 && rest_buf_tmp[tail_off - 1] == 0 {
             tail_off -= 1;
         }
-        // The "overload" heuristic upstream flips to emit the whole
-        // block when the significant region covers more than 2/3 of
-        // the space. Mirror that.
-        if tail_off > rest_data_size_no_avb / 3 * 2 {
+        if tail_off > rest_data_size / 3 * 2 {
             logi!(
-                "warning: rest data large. Rest size: {rest_data_size_no_avb}, significant: {tail_off}"
+                "warning: overload size of rest data. Rest data size: {rest_data_size}, actual used size: {tail_off}"
             );
-            rest_buf = raw_rest.to_vec();
+            rest_buf = rest_buf_tmp;
             rest_data_size = tail_off + avb_size_of;
         } else {
-            rest_buf = raw_rest[..tail_off].to_vec();
-            logi!("Rest data size: {rest_data_size_no_avb}, significant: {tail_off}");
+            rest_buf = rest_buf_tmp[..tail_off].to_vec();
+            logi!("Rest data size: {rest_data_size}, actual used size: {tail_off}");
             rest_data_size = tail_off;
         }
     }
@@ -675,14 +756,15 @@ pub fn repack_bootimg(
         0x41, 0x56, 0x42, 0x30, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
         0x00, 0x00, 0x00, 0x00,
     ];
-    let rest_buf_local = rest_buf.clone();
-    if !rest_buf_local.is_empty() {
+    if !rest_buf.is_empty() {
+        let scan_len = rest_data_size.min(rest_buf.len());
+        let scan_buf = &rest_buf[..scan_len];
         let mut last_avb: Option<usize> = None;
         for ver in [0x00u8, 0x01, 0x02] {
             avb_sig[18] = ver;
             let mut search = 0usize;
-            while search + avb_sig.len() <= rest_buf_local.len() {
-                let Some(rel) = rest_buf_local[search..]
+            while search + avb_sig.len() <= scan_buf.len() {
+                let Some(rel) = scan_buf[search..]
                     .windows(avb_sig.len())
                     .position(|w| w == avb_sig)
                 else {
@@ -700,35 +782,75 @@ pub fn repack_bootimg(
             avb.data_size1 = new_avb_size.swap_bytes();
             avb.data_size2 = new_avb_size.swap_bytes();
         }
-        // Write rest + footer, resizing the total length when the
-        // significant region overflows the original frame.
         if rest_data_size > total_size.saturating_sub(page_size as usize + new_k_total_aligned) {
-            let new_total = align_up(
+            total_size = align_up(
                 (page_size as usize + new_k_total_aligned + rest_data_size) as u32,
                 page_size,
             ) as usize;
-            let pad_len = new_total - page_size as usize - new_k_total_aligned - avb_size_of;
-            out.extend_from_slice(&rest_buf_local[..pad_len.min(rest_buf_local.len())]);
-            out.resize(page_size as usize + new_k_total_aligned + pad_len, 0);
-            out.extend_from_slice(bytemuck::bytes_of(&avb));
-        } else {
-            out.extend_from_slice(&rest_buf_local);
         }
+        debug_assert!(rest_data_size <= rest_buf.len());
+        out.extend_from_slice(&rest_buf[..rest_data_size]);
     }
 
-    // 5) Final zero pad + append footer when we didn't already.
-    if out.len() < total_size - avb_size_of {
+    // 5) Final zero pad + append footer. The equality case still writes the
+    // footer, but it must not attempt a zero-length allocation/write first.
+    if out.len() <= total_size - avb_size_of {
         out.resize(total_size - avb_size_of, 0);
         out.extend_from_slice(bytemuck::bytes_of(&avb));
-    }
-    // 6) Truncate / extend to match the original file length.
-    if out.len() < total_size {
-        out.resize(total_size, 0);
     }
 
     write_file(out_boot_path, &out)?;
     logi!("Repack completed: {}", out_boot_path.display());
     Ok(())
+}
+
+pub fn patch_bootimg(
+    bootimg_path: &Path,
+    kpimg_path: &Path,
+    out_boot_path: &Path,
+    superkey: &str,
+    root_key: bool,
+    additional: &[String],
+    extras: Vec<crate::patch::ExtraConfig>,
+) -> Result<()> {
+    kptools_base::log::set_log_enable(true);
+    logi!("patch boot image: {}", bootimg_path.display());
+    if superkey.is_empty() && !root_key {
+        return Err(Error::invalid_arg("empty superkey"));
+    }
+
+    let bootimg = kptools_base::io::read_file(bootimg_path)?;
+    let hdr_size = core::mem::size_of::<BootImgHdr>();
+    if bootimg.len() < hdr_size {
+        return Err(Error::bad_bootimg("truncated boot image"));
+    }
+    let hdr: BootImgHdr = *bytemuck::from_bytes(&bootimg[..hdr_size]);
+    if hdr.magic != *BOOT_MAGIC {
+        return Err(Error::bad_bootimg("invalid boot image magic"));
+    }
+
+    let page_size = hdr.page_size;
+    let header_ver = hdr.unused[0];
+    let kernel_offset = if (3..=10).contains(&header_ver) {
+        PAGE_SIZE_DEFAULT
+    } else {
+        page_size
+    };
+    let kernel_size = hdr.kernel_size as usize;
+    logi!("Kernel size: {kernel_size}, Header Version: {header_ver}, Offset: {kernel_offset}");
+    let start = kernel_offset as usize;
+    let end = start
+        .checked_add(kernel_size)
+        .ok_or_else(|| Error::bad_bootimg("kernel offset + size overflow"))?;
+    if end > bootimg.len() {
+        return Err(Error::bad_bootimg("kernel section past file end"));
+    }
+
+    let raw = auto_depress_to_mem(&bootimg[start..end])?;
+    let patched = crate::patch::patch_update_img_buf(
+        &raw, kpimg_path, superkey, root_key, additional, extras,
+    )?;
+    repack_bootimg_mem(bootimg_path, &patched, out_boot_path)
 }
 
 fn sec_slice(buf: &[u8], off: u32, size: u32) -> &[u8] {
@@ -803,6 +925,48 @@ mod tests {
         let out = dir.path().join("out.bin");
         decompress_gzip_to(&gz, &out).unwrap();
         assert_eq!(std::fs::read(&out).unwrap(), plain);
+        assert_eq!(auto_depress_to_mem(&gz).unwrap(), plain);
+    }
+
+    #[test]
+    fn is_bootimg_checks_android_magic() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("boot.img");
+        std::fs::write(&path, b"ANDROID!tail").unwrap();
+        assert!(is_bootimg(&path));
+        std::fs::write(&path, b"NOTBOOT!").unwrap();
+        assert!(!is_bootimg(&path));
+    }
+
+    #[test]
+    fn repack_mem_writes_footer_when_kernel_fills_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("boot.img");
+        let output = dir.path().join("new-boot.img");
+        let mut hdr = BootImgHdr::zeroed();
+        hdr.magic = *BOOT_MAGIC;
+        hdr.kernel_size = 4;
+        hdr.page_size = PAGE_SIZE_DEFAULT;
+        let footer = AvbFooter::zeroed();
+        let footer_size = core::mem::size_of::<AvbFooter>();
+        let mut image = vec![0u8; PAGE_SIZE_DEFAULT as usize * 2 + footer_size];
+        image[..core::mem::size_of::<BootImgHdr>()].copy_from_slice(bytemuck::bytes_of(&hdr));
+        image[PAGE_SIZE_DEFAULT as usize..PAGE_SIZE_DEFAULT as usize + 4].copy_from_slice(b"KERN");
+        let footer_offset = image.len() - footer_size;
+        image[footer_offset..].copy_from_slice(bytemuck::bytes_of(&footer));
+        std::fs::write(&input, image).unwrap();
+
+        repack_bootimg_mem(&input, b"NEWS", &output).unwrap();
+        let repacked = std::fs::read(output).unwrap();
+        assert_eq!(repacked.len(), PAGE_SIZE_DEFAULT as usize * 2 + footer_size);
+        assert_eq!(
+            &repacked[PAGE_SIZE_DEFAULT as usize..PAGE_SIZE_DEFAULT as usize + 4],
+            b"NEWS"
+        );
+        assert_eq!(
+            &repacked[repacked.len() - footer_size..],
+            bytemuck::bytes_of(&footer)
+        );
     }
 
     #[test]

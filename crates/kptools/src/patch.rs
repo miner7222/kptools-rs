@@ -1,4 +1,4 @@
-//! Kernel-image patch driver for KernelPatch 0.13.4.
+//! Kernel-image patch driver for KernelPatch 0.13.8.
 
 use sha2::Digest;
 
@@ -17,8 +17,8 @@ use crate::kpm::get_kpm_info;
 use crate::preset::{
     extra_flags_get_header_version, ExtraType, PatchExtraItem, Preset, ADDITIONAL_LEN,
     CONFIG_ANDROID, CONFIG_DEBUG, CONFIG_FLAG_X86_64, EXTRA_ALIGN, EXTRA_EVENT_LEN,
-    EXTRA_HDR_MAGIC, EXTRA_ITEM_MAX_NUM, EXTRA_NAME_LEN, HDR_BACKUP_SIZE, KP_MAGIC, KP_VERSION_U32,
-    MAGIC_LEN, PATCH_EXTRA_HEADER_VERSION_LEGACY, PATCH_EXTRA_ITEM_LEN, ROOT_SUPER_KEY_HASH_LEN,
+    EXTRA_HDR_MAGIC, EXTRA_ITEM_MAX_NUM, EXTRA_NAME_LEN, HDR_BACKUP_SIZE, KP_MAGIC, MAGIC_LEN,
+    PATCH_EXTRA_HEADER_VERSION_LEGACY, PATCH_EXTRA_ITEM_LEN, ROOT_SUPER_KEY_HASH_LEN,
     SUPER_KEY_LEN,
 };
 use crate::symbol::{
@@ -368,13 +368,6 @@ fn align_ceil_i32(v: i32, a: i32) -> i32 {
     }
 }
 
-pub fn ensure_supported_kpimg_version(ver_num: u32) -> Result<()> {
-    if ver_num != KP_VERSION_U32 {
-        return Err(Error::bad_kpimg(format!("unsupported kpimg version 0x{ver_num:x}; this tools port only supports 0x{KP_VERSION_U32:x}")));
-    }
-    Ok(())
-}
-
 pub struct PatchArgs<'a> {
     pub kimg_path: &'a std::path::Path,
     pub kpimg_path: &'a std::path::Path,
@@ -400,7 +393,8 @@ fn patch_update_x86(args: &PatchArgs<'_>) -> Result<()> {
         return Err(Error::bad_kpimg("x86 kpimg is too small"));
     }
     let mut preset: Preset = *bytemuck::from_bytes(&kpimg[..core::mem::size_of::<Preset>()]);
-    ensure_supported_kpimg_version(preset.header.kp_version.as_u32())?;
+    let ver_num = preset.header.kp_version.as_u32();
+    logi!("kpimg version: {ver_num:x}");
     let flags = preset.header.config_flags;
     if preset.header.magic != *KP_MAGIC || flags & CONFIG_FLAG_X86_64 == 0 {
         return Err(Error::bad_kpimg("kpimg is not an x86_64 payload"));
@@ -436,25 +430,61 @@ pub fn patch_update_img(mut args: PatchArgs<'_>) -> Result<()> {
         return patch_update_x86(&args);
     }
 
-    let mut kernel_file = KernelFile::read(args.kimg_path)?;
+    let kernel_file = KernelFile::read(args.kimg_path)?;
     if kernel_file.is_uncompressed_img() {
         logw!("kernel image with UNCOMPRESSED_IMG header");
     }
-    let pimg = parse_image_patch_info(kernel_file.kimg())?;
+    let out_kimg = patch_update_img_buf(
+        kernel_file.kimg(),
+        args.kpimg_path,
+        args.superkey,
+        args.root_key,
+        &args.additional,
+        std::mem::take(&mut args.extras),
+    )?;
+
+    if kernel_file.is_uncompressed_img() {
+        let mut kfile = Vec::with_capacity(20 + out_kimg.len());
+        kfile.extend_from_slice(&kernel_file.kfile[..20]);
+        kfile[16..20].copy_from_slice(&(out_kimg.len() as u32).to_le_bytes());
+        kfile.extend_from_slice(&out_kimg);
+        write_file(args.out_path, &kfile)?;
+    } else {
+        write_file(args.out_path, &out_kimg)?;
+    }
+    logi!("patch done: {}", args.out_path.display());
+    Ok(())
+}
+
+/// Patch a raw arm64 kernel image buffer, returning the patched kernel bytes.
+/// Shared core used by both `patch_update_img` (file) and `patch_bootimg`.
+pub fn patch_update_img_buf(
+    kimg_in: &[u8],
+    kpimg_path: &std::path::Path,
+    superkey: &str,
+    root_key: bool,
+    additional: &[String],
+    mut extras: Vec<ExtraConfig>,
+) -> Result<Vec<u8>> {
+    if superkey.is_empty() && !root_key {
+        return Err(Error::invalid_arg("empty superkey"));
+    }
+    let mut kimg = kimg_in.to_vec();
+    let pimg = parse_image_patch_info(&kimg)?;
     let kinfo = pimg.kinfo;
     let ori_kimg_len = pimg.ori_kimg_len;
     if let Some(po) = pimg.preset_offset {
-        let backup = preset_header_backup(read_preset(kernel_file.kimg(), po));
-        kernel_file.kimg_mut()[..HDR_BACKUP_SIZE].copy_from_slice(&backup);
+        let backup = preset_header_backup(read_preset(&kimg, po));
+        kimg[..HDR_BACKUP_SIZE].copy_from_slice(&backup);
     }
 
-    let mut kallsym_buf = kernel_file.kimg()[..ori_kimg_len].to_vec();
+    let mut kallsym_buf = kimg[..ori_kimg_len].to_vec();
     let mut kallsym = Kallsym::default();
     let ver = find_linux_banner(&mut kallsym, &kallsym_buf)?;
     let is_gki = ver >= 330_240;
     logi!("is_gki: {}", if is_gki { "true" } else { "false" });
     if ver > 395_008 {
-        if disable_pi_map(kernel_file.kimg_mut()).is_err() {
+        if disable_pi_map(&mut kimg).is_err() {
             logi!("kernel have patched or not found");
         } else {
             logi!("disabled PI_MAP for kernel version > 6.12.23");
@@ -473,16 +503,15 @@ pub fn patch_update_img(mut args: PatchArgs<'_>) -> Result<()> {
         }
     };
     let align_kernel_size = align_ceil_i32(kinfo.kernel_size, SZ_4K as i32) as usize;
-    let kpimg = read_file_align(args.kpimg_path, 0x10)?;
+    let kpimg = read_file_align(kpimg_path, 0x10)?;
     let kpimg_len = kpimg.len();
 
-    args.extras
-        .sort_by_key(|item| std::cmp::Reverse(item.priority));
-    if args.extras.len() > EXTRA_ITEM_MAX_NUM {
+    extras.sort_by_key(|item| std::cmp::Reverse(item.priority));
+    if extras.len() > EXTRA_ITEM_MAX_NUM {
         return Err(Error::invalid_arg("too many extras"));
     }
     let mut extra_size = PATCH_EXTRA_ITEM_LEN;
-    for cfg in &mut args.extras {
+    for cfg in &mut extras {
         if let Some(name) = &cfg.set_name {
             if name.len() >= EXTRA_NAME_LEN {
                 return Err(Error::invalid_arg("extra name too long"));
@@ -517,19 +546,17 @@ pub fn patch_update_img(mut args: PatchArgs<'_>) -> Result<()> {
     }
     logi!("layout kimg: 0x0,0x{ori_kimg_len:x}, kpimg: 0x{align_kimg_len:x},0x{kpimg_len:x}, extra: 0x{out_img_len:x},0x{extra_size:x}, end: 0x{out_all_len:x}, start: 0x{start_offset:x}");
 
-    let mut out_kf = KernelFile::new_from(&kernel_file, out_all_len);
-    out_kf.kimg_mut()[..ori_kimg_len].copy_from_slice(&kernel_file.kimg()[..ori_kimg_len]);
-    out_kf.kimg_mut()[ori_kimg_len..align_kimg_len].fill(0);
-    out_kf.kimg_mut()[align_kimg_len..align_kimg_len + kpimg_len].copy_from_slice(&kpimg);
+    let mut out = vec![0u8; out_all_len];
+    out[..ori_kimg_len].copy_from_slice(&kimg[..ori_kimg_len]);
+    out[align_kimg_len..align_kimg_len + kpimg_len].copy_from_slice(&kpimg);
 
     let preset_off = align_kimg_len;
     let preset_end = preset_off + core::mem::size_of::<Preset>();
-    if preset_end > out_kf.kimg_len() {
+    if preset_end > out.len() {
         return Err(Error::bad_kpimg("kpimg preset is truncated"));
     }
-    let mut new_preset: Preset = *bytemuck::from_bytes(&out_kf.kimg()[preset_off..preset_end]);
+    let mut new_preset: Preset = *bytemuck::from_bytes(&out[preset_off..preset_end]);
     let ver_num = new_preset.header.kp_version.as_u32();
-    ensure_supported_kpimg_version(ver_num)?;
     let compile_time = new_preset.header.compile_time;
     let flags = new_preset.header.config_flags;
     let is_android = flags & CONFIG_ANDROID != 0;
@@ -565,7 +592,7 @@ pub fn patch_update_img(mut args: PatchArgs<'_>) -> Result<()> {
     let sync_start = map_start as usize;
     let sync_size = ((map_max_size * 2) as usize).min(ori_kimg_len.saturating_sub(sync_start));
     if sync_size > 0 {
-        out_kf.kimg_mut()[sync_start..sync_start + sync_size]
+        out[sync_start..sync_start + sync_size]
             .copy_from_slice(&kallsym_buf[sync_start..sync_start + sync_size]);
     }
 
@@ -603,10 +630,10 @@ pub fn patch_update_img(mut args: PatchArgs<'_>) -> Result<()> {
     new_preset.setup.patch_config =
         fillin_patch_config(&kallsym, &kallsym_buf, imglen, is_android)?;
 
-    if !args.root_key {
-        copy_cstr_into(&mut new_preset.setup.superkey, args.superkey.as_bytes());
-    } else if !args.superkey.is_empty() {
-        let hash = sha2::Sha256::digest(args.superkey.as_bytes());
+    if !root_key {
+        copy_cstr_into(&mut new_preset.setup.superkey, superkey.as_bytes());
+    } else if !superkey.is_empty() {
+        let hash = sha2::Sha256::digest(superkey.as_bytes());
         new_preset
             .setup
             .root_superkey
@@ -621,14 +648,14 @@ pub fn patch_update_img(mut args: PatchArgs<'_>) -> Result<()> {
 
     let text_offset = (align_kimg_len + SZ_4K) as u64;
     write_b(
-        out_kf.kimg_mut(),
+        &mut out,
         kinfo.b_stext_insn_offset as usize,
         kinfo.b_stext_insn_offset as u64,
         text_offset,
     )?;
 
     let mut add_pos = 0usize;
-    for kv in &args.additional {
+    for kv in additional {
         if !kv.contains('=') {
             return Err(Error::invalid_arg("addition must be key=value"));
         }
@@ -642,31 +669,27 @@ pub fn patch_update_img(mut args: PatchArgs<'_>) -> Result<()> {
         new_preset.setup.additional[add_pos..add_pos + kv.len()].copy_from_slice(kv.as_bytes());
         add_pos += kv.len();
     }
-    out_kf.kimg_mut()[preset_off..preset_end].copy_from_slice(bytemuck::bytes_of(&new_preset));
+    out[preset_off..preset_end].copy_from_slice(bytemuck::bytes_of(&new_preset));
 
     let mut cursor = out_img_len;
-    for cfg in &args.extras {
+    for cfg in &extras {
         let item = sanitize_legacy_extra_item(cfg.item);
-        out_kf.kimg_mut()[cursor..cursor + PATCH_EXTRA_ITEM_LEN]
-            .copy_from_slice(bytemuck::bytes_of(&item));
+        out[cursor..cursor + PATCH_EXTRA_ITEM_LEN].copy_from_slice(bytemuck::bytes_of(&item));
         cursor += PATCH_EXTRA_ITEM_LEN;
         if item.args_size > 0 {
             let args_len = item.args_size as usize;
             if let Some(s) = &cfg.set_args {
                 let take = s.len().min(args_len);
-                out_kf.kimg_mut()[cursor..cursor + take].copy_from_slice(&s.as_bytes()[..take]);
+                out[cursor..cursor + take].copy_from_slice(&s.as_bytes()[..take]);
             }
             cursor += args_len;
         }
         let con = item.con_size.max(0) as usize;
-        out_kf.kimg_mut()[cursor..cursor + con].copy_from_slice(&cfg.data[..con]);
+        out[cursor..cursor + con].copy_from_slice(&cfg.data[..con]);
         cursor += con;
     }
-    out_kf.kimg_mut()[cursor..cursor + PATCH_EXTRA_ITEM_LEN].fill(0);
-    out_kf.resize_kimg(out_all_len);
-    out_kf.write(args.out_path)?;
-    logi!("patch done: {}", args.out_path.display());
-    Ok(())
+    out[cursor..cursor + PATCH_EXTRA_ITEM_LEN].fill(0);
+    Ok(out)
 }
 
 fn hexstr_to_bytes(s: &str) -> Vec<u8> {
@@ -940,10 +963,8 @@ mod tests {
     }
 
     #[test]
-    fn supported_version_is_0134() {
-        assert_eq!(KP_VERSION_U32, 0x0d04);
-        ensure_supported_kpimg_version(0x0d04).unwrap();
-        assert!(ensure_supported_kpimg_version(0x0d02).is_err());
+    fn supported_version_is_0138() {
+        assert_eq!(crate::preset::KP_VERSION_U32, 0x0d08);
     }
 
     #[test]

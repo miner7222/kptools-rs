@@ -1,6 +1,6 @@
 //! Kallsyms table parser.
 //!
-//! Port of upstream `tools/kallsym.{c,h}` at KernelPatch 0.13.4.
+//! Port of upstream `tools/kallsym.{c,h}` at KernelPatch 0.13.8.
 
 use kptools_base::{logi, logw, Error, Result};
 
@@ -822,39 +822,59 @@ fn find_num_syms(info: &mut Kallsym, img: &[u8]) -> Result<()> {
     Ok(())
 }
 
-fn arm64_verify_pid_vnr(info: &mut Kallsym, img: &[u8], offset: i32) -> Result<()> {
+fn arm64_verify_pid_vnr_window(
+    info: &mut Kallsym,
+    img: &[u8],
+    offset: i32,
+    back: i32,
+    fwd: i32,
+    generic_sp: bool,
+) -> Result<()> {
     use crate::insn::{
         aarch64_get_insn_class, aarch64_insn_decode_register, aarch64_insn_extract_system_reg,
         InsnClass, RegType, AARCH64_INSN_REG_SP, AARCH64_INSN_SPCLREG_SP_EL0,
     };
-    if offset <= 0 {
-        return Err(Error::kallsym("pid_vnr offset invalid"));
-    }
-    for i in 0..6 {
-        let at = offset as usize + i * 4;
-        if at + 4 > img.len() {
-            break;
+    let mut i = -back;
+    while i < fwd {
+        let insn_offset = offset + i * 4;
+        if insn_offset < 0 || insn_offset as usize + 4 > img.len() {
+            i += 1;
+            continue;
         }
+        let at = insn_offset as usize;
         let insn = u32::from_le_bytes(img[at..at + 4].try_into().unwrap());
-        match aarch64_get_insn_class(insn) {
-            InsnClass::BrSys
-                if aarch64_insn_extract_system_reg(insn) == AARCH64_INSN_SPCLREG_SP_EL0 =>
-            {
-                info.current_type = CurrentType::SpEl0;
-                logi!("pid_vnr verfied sp_el0, insn: 0x{insn:x}");
-                return Ok(());
-            }
-            InsnClass::DpImm
-                if aarch64_insn_decode_register(RegType::Rn, insn) == AARCH64_INSN_REG_SP =>
-            {
-                info.current_type = CurrentType::Sp;
-                logi!("pid_vnr verfied sp, insn: 0x{insn:x}");
-                return Ok(());
-            }
-            _ => {}
+        let enc = aarch64_get_insn_class(insn);
+        if matches!(enc, InsnClass::BrSys)
+            && aarch64_insn_extract_system_reg(insn) == AARCH64_INSN_SPCLREG_SP_EL0
+        {
+            info.current_type = CurrentType::SpEl0;
+            logi!("pid_vnr verfied sp_el0, insn: 0x{insn:x} (off {i:+})");
+            return Ok(());
         }
+        if generic_sp
+            && i >= 0
+            && matches!(enc, InsnClass::DpImm)
+            && aarch64_insn_decode_register(RegType::Rn, insn) == AARCH64_INSN_REG_SP
+        {
+            info.current_type = CurrentType::Sp;
+            logi!("pid_vnr verfied sp, insn: 0x{insn:x}");
+            return Ok(());
+        }
+        i += 1;
     }
     Err(Error::kallsym("pid_vnr verification failed"))
+}
+
+fn arm64_verify_pid_vnr(info: &mut Kallsym, img: &[u8], offset: i32, wide: bool) -> Result<()> {
+    if !wide {
+        // strict pass: 'current' loaded in the first instructions of the entry
+        arm64_verify_pid_vnr_window(info, img, offset, 0, 6, true)
+    } else {
+        // wide pass: LTO/ICF folded kernels may point the kallsyms entry into
+        // the middle of the surviving function, so only the strong sp_el0
+        // system register read is scanned across a wider window.
+        arm64_verify_pid_vnr_window(info, img, offset, 4, 12, false)
+    }
 }
 
 fn correct_addresses_or_offsets_by_banner(info: &mut Kallsym, img: &[u8]) -> Result<()> {
@@ -935,7 +955,7 @@ fn correct_addresses_or_offsets_by_banner(info: &mut Kallsym, img: &[u8]) -> Res
     }
     if info.arch == ArchType::Arm64 {
         let pid = get_symbol_offset_zero(info, img, "pid_vnr");
-        if arm64_verify_pid_vnr(info, img, pid).is_err() {
+        if arm64_verify_pid_vnr(info, img, pid, false).is_err() {
             logw!("pid_vnr verification failed");
         }
     }
@@ -990,27 +1010,34 @@ fn correct_addresses_or_offsets_by_vectors(info: &mut Kallsym, img: &[u8]) -> Re
     let mut end = start + (max_shift + 1) * elem as i32;
     end = end.min(info.approx_addresses_or_offsets_end - pid_index * elem as i32);
     let mut found = None;
-    'outer: for base in bases {
-        let mut p = start;
-        while p < end {
-            let vo = p as usize + vector_index as usize * elem;
-            let po = p as usize + pid_index as usize * elem;
-            if po + elem > img.len() || vo + elem * 2 > img.len() {
-                break;
-            }
-            let vector = uint_unpack(&img[vo..], elem, info.is_be).wrapping_sub(base) as i32;
-            let next = uint_unpack(&img[vo + elem..], elem, info.is_be).wrapping_sub(base) as i32;
-            if next - vector >= 0x600 && vector & ((1 << 11) - 1) == 0 {
-                let pid = uint_unpack(&img[po..], elem, info.is_be).wrapping_sub(base) as i32;
-                let mut probe = info.clone();
-                if arm64_verify_pid_vnr(&mut probe, img, pid).is_ok() {
-                    info.current_type = probe.current_type;
-                    info.kernel_base = base;
-                    found = Some(p);
-                    break 'outer;
+    // pass 0 verifies pid_vnr strictly within its first instructions; pass 1
+    // widens the window for LTO/ICF folded kernels whose pid_vnr entry is
+    // mid-function, only matching the strong sp_el0 system register read.
+    'outer: for pass in 0..2 {
+        let wide = pass != 0;
+        for base in bases.iter().copied() {
+            let mut p = start;
+            while p < end {
+                let vo = p as usize + vector_index as usize * elem;
+                let po = p as usize + pid_index as usize * elem;
+                if po + elem > img.len() || vo + elem * 2 > img.len() {
+                    break;
                 }
+                let vector = uint_unpack(&img[vo..], elem, info.is_be).wrapping_sub(base) as i32;
+                let next =
+                    uint_unpack(&img[vo + elem..], elem, info.is_be).wrapping_sub(base) as i32;
+                if next - vector >= 0x600 && vector & ((1 << 11) - 1) == 0 {
+                    let pid = uint_unpack(&img[po..], elem, info.is_be).wrapping_sub(base) as i32;
+                    let mut probe = info.clone();
+                    if arm64_verify_pid_vnr(&mut probe, img, pid, wide).is_ok() {
+                        info.current_type = probe.current_type;
+                        info.kernel_base = base;
+                        found = Some(p);
+                        break 'outer;
+                    }
+                }
+                p += elem as i32;
             }
-            p += elem as i32;
         }
     }
     let p = found.ok_or_else(|| Error::kallsym("can't locate vectors"))?;

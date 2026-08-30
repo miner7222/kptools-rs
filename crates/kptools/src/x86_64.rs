@@ -1,6 +1,6 @@
 //! x86_64 bzImage loader/repacker and KernelPatch payload injector.
 //!
-//! Port of upstream `tools/x86_64.{c,h}` at KernelPatch 0.13.4.
+//! Port of upstream `tools/x86_64.{c,h}` at KernelPatch 0.13.8.
 //! Compression stays in-process through `flate2`; unlike upstream we
 //! never shell out to a system `gzip` binary.
 
@@ -34,6 +34,8 @@ const ELFCLASS64: u8 = 2;
 const ELFDATA2LSB: u8 = 1;
 const ELF64_EHDR_SIZE: usize = 64;
 const ELF64_PHDR_SIZE: usize = 56;
+const ELF64_SHDR_SIZE: usize = 64;
+const SHF_ALLOC: u64 = 2;
 
 #[derive(Default, Debug)]
 pub struct X86Bzimage {
@@ -301,6 +303,76 @@ fn flat_offset_to_va(image: &X86Bzimage, flat_offset: u64) -> Result<u64> {
     ))
 }
 
+fn flat_offset_section_name(image: &X86Bzimage, flat_offset: u64) -> &str {
+    let Ok(va) = flat_offset_to_va(image, flat_offset) else {
+        return "<unknown>";
+    };
+    let Ok(shoff) = get_le64(&image.elf, 40).and_then(|v| {
+        usize::try_from(v).map_err(|_| Error::bad_kernel("ELF section table offset overflow"))
+    }) else {
+        return "<unknown>";
+    };
+    let (Ok(shentsize), Ok(shnum), Ok(shstrndx)) = (
+        get_le16(&image.elf, 58).map(usize::from),
+        get_le16(&image.elf, 60).map(usize::from),
+        get_le16(&image.elf, 62).map(usize::from),
+    ) else {
+        return "<unknown>";
+    };
+    if shoff == 0
+        || shentsize != ELF64_SHDR_SIZE
+        || shstrndx >= shnum
+        || shoff > image.elf.len()
+        || shnum
+            .checked_mul(ELF64_SHDR_SIZE)
+            .is_none_or(|size| size > image.elf.len() - shoff)
+    {
+        return "<unknown>";
+    }
+
+    let strtab = shoff + shstrndx * ELF64_SHDR_SIZE;
+    let (Ok(names_offset), Ok(names_size)) = (
+        get_le64(&image.elf, strtab + 24).and_then(|v| {
+            usize::try_from(v).map_err(|_| Error::bad_kernel("ELF string table offset overflow"))
+        }),
+        get_le64(&image.elf, strtab + 32).and_then(|v| {
+            usize::try_from(v).map_err(|_| Error::bad_kernel("ELF string table size overflow"))
+        }),
+    ) else {
+        return "<unknown>";
+    };
+    if names_offset > image.elf.len() || names_size > image.elf.len() - names_offset {
+        return "<unknown>";
+    }
+    let names = &image.elf[names_offset..names_offset + names_size];
+
+    for index in 0..shnum {
+        let sh = shoff + index * ELF64_SHDR_SIZE;
+        let (Ok(name), Ok(flags), Ok(addr), Ok(size)) = (
+            get_le32(&image.elf, sh).map(|v| v as usize),
+            get_le64(&image.elf, sh + 8),
+            get_le64(&image.elf, sh + 16),
+            get_le64(&image.elf, sh + 32),
+        ) else {
+            return "<unknown>";
+        };
+        if flags & SHF_ALLOC == 0
+            || size == 0
+            || va < addr
+            || va - addr >= size
+            || name >= names.len()
+        {
+            continue;
+        }
+        let end = names[name..]
+            .iter()
+            .position(|&byte| byte == 0)
+            .map_or(names.len(), |len| name + len);
+        return std::str::from_utf8(&names[name..end]).unwrap_or("<unknown>");
+    }
+    "<gap>"
+}
+
 fn flat_range_ok(image: &X86Bzimage, offset: u64, size: u64) -> bool {
     offset <= image.flat.len() as u64 && size <= image.flat.len() as u64 - offset
 }
@@ -395,6 +467,24 @@ pub fn inject_x86_kpimg(image: &mut X86Bzimage, kpimg: &mut [u8]) -> Result<()> 
         .header_backup
         .copy_from_slice(&image.flat[call_site_offset..call_site_offset + HDR_BACKUP_SIZE]);
 
+    // Populate the architecture-neutral bootstrap symbols used by the first
+    // x86 runtime stage. They remain flat-image offsets, matching arm64's
+    // kernel-relative preset convention. Missing optional symbols stay zero.
+    if let Some(off) = get_symbol_offset(&kallsym, &image.flat, "kallsyms_lookup_name") {
+        if off >= 0 {
+            preset.setup.kallsyms_lookup_name_offset = off as i64;
+            preset.setup.patch_config.kallsyms_lookup_name = off as u64;
+        }
+    }
+    let printk = get_symbol_offset(&kallsym, &image.flat, "printk")
+        .or_else(|| get_symbol_offset(&kallsym, &image.flat, "_printk"));
+    if let Some(off) = printk {
+        if off >= 0 {
+            preset.setup.printk_offset = off as i64;
+            preset.setup.patch_config.printk = off as u64;
+        }
+    }
+
     let tramp = trampoline_flat as usize;
     let trampoline = &mut image.flat[tramp..tramp + TRAMPOLINE_SIZE];
     trampoline.fill(0);
@@ -417,8 +507,12 @@ pub fn inject_x86_kpimg(image: &mut X86Bzimage, kpimg: &mut [u8]) -> Result<()> 
     kpimg[..core::mem::size_of::<Preset>()].copy_from_slice(bytemuck::bytes_of(&preset));
     let payload_at = payload_flat as usize;
     image.flat[payload_at..payload_at + kpimg.len()].copy_from_slice(kpimg);
-    logi!("x86 kpimg injected: segment {}, start_kernel 0x{:x}, trampoline 0x{:x}, payload 0x{:x}+0x{:x}, entry 0x{:x}",
-        segment.index, call_site_va, trampoline_phys, payload_phys, kpimg.len(), payload_entry);
+    let section_name = flat_offset_section_name(image, payload_flat);
+    let kallsyms_lookup_name_offset = preset.setup.kallsyms_lookup_name_offset;
+    let printk_offset = preset.setup.printk_offset;
+    logi!("x86 kpimg injected: segment {}, section {}, start_kernel 0x{:x}, trampoline 0x{:x}, payload 0x{:x}+0x{:x}, entry 0x{:x}, kallsyms_lookup_name 0x{:x}, printk 0x{:x}",
+        segment.index, section_name, call_site_va, trampoline_phys, payload_phys, kpimg.len(), payload_entry,
+        kallsyms_lookup_name_offset, printk_offset);
     Ok(())
 }
 

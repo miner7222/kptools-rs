@@ -1,13 +1,14 @@
 //! Symbol lookup helpers + map-area / patch-config fillers.
 //!
-//! Port of upstream `tools/symbol.{c,h}` at KernelPatch 0.13.4.
+//! Port of upstream `tools/symbol.{c,h}` at KernelPatch 0.13.8.
 
 use kptools_base::{logi, logw, Error, Result};
 
 use crate::kallsym::{get_symbol_offset, get_symbol_offset_zero, on_each_symbol, Kallsym};
 use crate::preset::{
-    MapSymbol, PatchConfig, MAP_SYM_MEMBLOCK_ALLOC_TRY_NID, MAP_SYM_MEMBLOCK_PHYS_ALLOC_TRY_NID,
-    MAP_SYM_MEMBLOCK_VIRT_ALLOC_FROM_ALLOC_TRY_NID, MAP_SYM_MEMBLOCK_VIRT_ALLOC_TRY_NID,
+    MapSymbol, PatchConfig, MAP_MAX_SIZE, MAP_SYM_MEMBLOCK_ALLOC_TRY_NID,
+    MAP_SYM_MEMBLOCK_PHYS_ALLOC_TRY_NID, MAP_SYM_MEMBLOCK_VIRT_ALLOC_FROM_ALLOC_TRY_NID,
+    MAP_SYM_MEMBLOCK_VIRT_ALLOC_TRY_NID,
 };
 
 pub fn find_suffixed_symbol(info: &Kallsym, img: &[u8], prefix: &str) -> i32 {
@@ -146,12 +147,15 @@ pub fn select_map_area(
     let (addr, selected) = get_map_anchor_offset(info, img, imglen)?;
     logi!("select map anchor: {selected}, offset: 0x{addr:08x}");
 
+    // The hole must hold the whole map section (map_data + map code) so the
+    // map_prepare copy never spills past the NOP-synced area; 0.13.8 widened
+    // it from 0x800 to MAP_MAX_SIZE (0x1000).
     if !is_gki {
-        return Ok((align_ceil(addr, 16), 0x800));
+        return Ok((align_ceil(addr, 16), MAP_MAX_SIZE as i32));
     }
 
     let map_start = align_floor(addr, 16);
-    let max_size = 0x800_i32;
+    let max_size = MAP_MAX_SIZE as i32;
     let mut count = 0_u32;
     let mut first_pac_seen = false;
     let mut last_pos = 0_u32;
@@ -192,11 +196,10 @@ pub fn select_map_area(
             j += 4;
         }
         logi!("second_pos: {second_pos:x}");
-        if second_pos != 0 {
-            let at = (addr + second_pos) as usize;
-            if at + 4 <= img.len() {
-                img[at..at + 4].copy_from_slice(&NOP_INSN.to_le_bytes());
-            }
+        // Upstream NOPs addr+second_pos unconditionally (second_pos defaults 0).
+        let at = (addr + second_pos) as usize;
+        if at + 4 <= img.len() {
+            img[at..at + 4].copy_from_slice(&NOP_INSN.to_le_bytes());
         }
     }
     Ok((map_start, max_size))
@@ -213,7 +216,11 @@ pub fn fillin_map_symbol(info: &Kallsym, img: &[u8]) -> Result<MapSymbol> {
         memblock_virt_alloc_type: 0,
     };
 
-    symbol.memblock_reserve_relo = get_symbol_offset_exit(info, img, "memblock_reserve")? as u64;
+    symbol.memblock_reserve_relo = try_get_symbol_offset_zero(info, img, "memblock_reserve") as u64;
+    if symbol.memblock_reserve_relo == 0 {
+        symbol.memblock_reserve_relo =
+            get_symbol_offset_exit(info, img, "__memblock_reserve")? as u64;
+    }
     symbol.memblock_free_relo = get_symbol_offset_exit(info, img, "memblock_free")? as u64;
     symbol.memblock_mark_nomap_relo =
         get_symbol_offset_zero(info, img, "memblock_mark_nomap") as u64;

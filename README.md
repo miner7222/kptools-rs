@@ -1,7 +1,7 @@
 # kptools-rs
 
 Pure-Rust port of the `tools/` directory from
-[bmax121/KernelPatch](https://github.com/bmax121/KernelPatch) v0.13.4.
+[bmax121/KernelPatch](https://github.com/bmax121/KernelPatch) v0.13.8.
 
 The upstream `kptools` patches arm64 raw kernel images and x86_64
 `bzImage` kernels with a `kpimg` (KernelPatch kernel-mode image),
@@ -27,15 +27,15 @@ The x86_64 bzImage path uses `flate2` and does not invoke an external
 | `order.c/h`        | `base/src/endian`          | ported          |
 | `image.c/h`        | `kptools::image`           | ported          |
 | `insn.{c,h}`       | `kptools::insn`            | subset ported   |
-| `kallsym.c/h`      | `kptools::kallsym`         | ported (0.13.4) |
-| `symbol.c/h`       | `kptools::symbol`          | ported (0.13.4) |
+| `kallsym.c/h`      | `kptools::kallsym`         | ported (0.13.8) |
+| `symbol.c/h`       | `kptools::symbol`          | ported (0.13.8) |
 | `kpm.c/h`          | `kptools::kpm`             | ported          |
-| `patch.c/h`        | `kptools::patch`           | ported (0.13.4) |
-| `x86_64.c/h`       | `kptools::x86_64`          | ported          |
-| `bootimg.c/h`      | `kptools::bootimg`         | ported          |
-| `kptools.c`        | `kptools::cli`             | ported          |
+| `patch.c/h`        | `kptools::patch`           | ported (0.13.8) |
+| `x86_64.c/h`       | `kptools::x86_64`          | ported (0.13.8) |
+| `bootimg.c/h`      | `kptools::bootimg`         | ported (0.13.8) |
+| `kptools.c`        | `kptools::cli`             | ported (0.13.8) |
 
-KernelPatch 0.13.4 compatibility includes the version-aware
+KernelPatch 0.13.8 compatibility includes the version-aware
 `header_backup` lookup used for upgrading/unpatching older patched
 images, legacy extra-header flag sanitizing, legacy `kconfig` extra
 skipping, x86_64 relative/absolute-percpu kallsyms decoding, marker
@@ -52,12 +52,12 @@ locates and inflates the gzip-compressed ELF64 payload, flattens
 `PT_LOAD` segments, resolves `start_kernel`, and replaces its 5-byte
 ftrace NOP with a `call rel32` to a 16-byte trampoline. The kpimg is
 placed in an executable zero run and entered at `KP_X86_ENTRY_OFFSET`
-(`0x800`). Repacking preserves the fixed compressed-payload slot,
+(`0x600`). Repacking preserves the fixed compressed-payload slot,
 updates `payload_length` / `syssize`, and regenerates the bzImage
 checksum. Unpatch restores the saved 8-byte `start_kernel` header and
 clears the injected payload/trampoline.
 
-As in upstream 0.13.4, x86_64 patching currently rejects KPM extras
+As in upstream 0.13.8, x86_64 patching currently rejects KPM extras
 and `-a` additional properties.
 
 End-to-end validation against a real bootable x86_64 bzImage has not yet

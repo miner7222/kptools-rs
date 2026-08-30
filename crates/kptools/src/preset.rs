@@ -1,7 +1,7 @@
 //! On-disk preset structures + constants.
 //!
 //! Direct port of upstream `kernel/include/preset.h`, pinned to
-//! tag 0.13.4. Field order, packing, and embedded size constants
+//! tag 0.13.8. Field order, packing, and embedded size constants
 //! match the C build byte-for-byte so a patched kernel produced by
 //! this crate is interchangeable with the reference `kptools` binary.
 
@@ -15,7 +15,7 @@ pub const ROOT_SUPER_KEY_HASH_LEN: usize = 0x20;
 pub const SETUP_PRESERVE_LEN: usize = 0x40;
 pub const HDR_BACKUP_SIZE: usize = 0x8;
 pub const COMPILE_TIME_LEN: usize = 0x18;
-pub const MAP_MAX_SIZE: usize = 0xa00;
+pub const MAP_MAX_SIZE: usize = 0x1000;
 pub const HOOK_ALLOC_SIZE: usize = 1 << 20;
 pub const MEMORY_ROX_SIZE: usize = 4 << 20;
 pub const MEMORY_RW_SIZE: usize = 2 << 20;
@@ -24,11 +24,11 @@ pub const MAP_ALIGN: usize = 0x10;
 pub const CONFIG_DEBUG: u64 = 1 << 0;
 pub const CONFIG_ANDROID: u64 = 1 << 1;
 pub const CONFIG_FLAG_X86_64: u64 = 1 << 2;
-pub const KP_X86_ENTRY_OFFSET: usize = 0x800;
+pub const KP_X86_ENTRY_OFFSET: usize = 0x600;
 
 pub const KP_VERSION_MAJOR: u8 = 0;
 pub const KP_VERSION_MINOR: u8 = 13;
-pub const KP_VERSION_PATCH: u8 = 4;
+pub const KP_VERSION_PATCH: u8 = 8;
 pub const KP_VERSION_U32: u32 = pack_version(KP_VERSION_MAJOR, KP_VERSION_MINOR, KP_VERSION_PATCH);
 
 pub const MAP_SYMBOL_NUM: usize = 7;
@@ -379,14 +379,15 @@ mod tests {
     }
 
     #[test]
-    fn version_pack_matches_0134() {
-        assert_eq!(KP_VERSION_U32, 0x0d04);
-        assert_eq!(VersionT::new(0, 13, 4).as_u32(), 0x0d04);
+    fn version_pack_matches_0138() {
+        assert_eq!(KP_VERSION_U32, 0x0d08);
+        assert_eq!(VersionT::new(0, 13, 8).as_u32(), 0x0d08);
     }
 
     #[test]
     fn x86_constants_match_upstream() {
         assert_eq!(CONFIG_FLAG_X86_64, 1 << 2);
-        assert_eq!(KP_X86_ENTRY_OFFSET, 0x800);
+        assert_eq!(KP_X86_ENTRY_OFFSET, 0x600);
+        assert_eq!(MAP_MAX_SIZE, 0x1000);
     }
 }

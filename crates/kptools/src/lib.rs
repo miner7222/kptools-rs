@@ -1,4 +1,4 @@
-//! Pure-Rust port of the userspace `tools/` half of KernelPatch 0.13.4.
+//! Pure-Rust port of the userspace `tools/` half of KernelPatch 0.13.8.
 //!
 //! The crate keeps the on-disk preset ABI and CLI behavior aligned with
 //! upstream while supporting both arm64 raw kernel images and x86_64
