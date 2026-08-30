@@ -20,8 +20,8 @@ digest = "0.11"
 flate2 = { version = "1", features = ["zlib-rs"] }
 bzip2 = "0.6"
 lz4 = "1"
-lz4_flex = { version = "0.13", default-features = false, features = ["std"] }
-lzma-rust2 = "0.16"
+lz4_flex = { version = "0.14", default-features = false, features = ["std"] }
+lzma-rust2 = "0.20"
 zstd = "0.13"
 
 [dev-dependencies]
