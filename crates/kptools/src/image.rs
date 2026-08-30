@@ -1,18 +1,7 @@
-//! Arm64 kernel image header decode.
+//! Arm64 kernel image header decoding, ported from upstream
+//! `tools/image.{c,h}`.
 //!
-//! Port of upstream `tools/image.{c,h}`. Reads the fixed layout
-//! Linux keeps at `arch/arm64/kernel/head.S`:
-//! `[MZ|b stext] … kernel_offset (LE u64) … magic="ARM\x64" …`.
-//!
-//! We need three things from here:
-//! - the `is_be` flag (0/1 — drives every endian-sensitive access
-//!   further down the pipeline),
-//! - the `kernel_size` + `load_offset` + `page_shift` (layout math),
-//! - the offset of the `b stext` instruction we patch to redirect
-//!   entry through kpimg.
-//!
-//! The UEFI `MZ` branch uses a different initial instruction location
-//! — upstream detects it by checking the first two bytes. Mirror that.
+//! UEFI images place the initial `b stext` instruction at a different offset.
 
 use bytemuck::{Pod, Zeroable};
 
@@ -24,17 +13,15 @@ pub const KERNEL_MAGIC: &[u8; 4] = b"ARM\x64";
 /// Mirrors upstream `kernel_info_t`.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct KernelInfo {
-    /// 0 little-endian, 1 big-endian. Matches the C `int8_t` field.
+    /// `0` for little-endian and `1` for big-endian.
     pub is_be: i8,
     pub uefi: i8,
     pub load_offset: i32,
     pub kernel_size: i32,
     pub page_shift: i32,
-    /// Offset within the image of the `b stext` instruction we
-    /// overwrite to redirect entry through kpimg.
+    /// Image offset of the `b stext` instruction patched for kpimg entry.
     pub b_stext_insn_offset: i32,
-    /// Offset the original `b stext` jumped to, decoded from the
-    /// instruction's immediate field.
+    /// Target offset of the original `b stext` instruction.
     pub primary_entry_offset: i32,
 }
 
@@ -55,9 +42,7 @@ struct Arm64HdrNefi {
 #[repr(C, packed)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct Arm64Hdr {
-    /// The C code uses a union of `efi` / `nefi` for the first 8
-    /// bytes. Both alternatives are 8 bytes so we just read the raw
-    /// bytes and decode after sniffing the `MZ` prefix.
+    /// Raw bytes preserve the C `efi`/`nefi` union layout.
     hdr_raw: [u8; 8],
     kernel_offset: u64,
     kernel_size_le: u64,
@@ -123,10 +108,6 @@ pub fn get_kernel_info(img: &[u8]) -> Result<KernelInfo> {
     };
     info.b_stext_insn_offset = b_stext_insn_offset;
 
-    // `b` instruction decode — upstream mirrors the `(insn &
-    // 0xFC000000) == 0x14000000` check. The immediate is
-    // left-shifted by 2 (byte offset) and added to the instruction
-    // offset.
     let b_insn = u32::from_le(b_primary_entry_insn);
     if (b_insn & 0xFC00_0000) != 0x1400_0000 {
         return Err(Error::bad_kernel(format!(
@@ -157,15 +138,12 @@ pub fn get_kernel_info(img: &[u8]) -> Result<KernelInfo> {
 mod tests {
     use super::*;
 
-    /// Fabricate a minimal arm64 header (non-UEFI variant) and
-    /// confirm the decoded fields match.
     #[test]
     fn decode_non_uefi_header() {
         let mut buf = vec![0u8; 128];
-        // `b +0x100` (0x14000040) at offset 0
         buf[0..4].copy_from_slice(&0x1400_0040_u32.to_le_bytes());
-        buf[8..16].copy_from_slice(&0x80000_u64.to_le_bytes()); // load offset
-        buf[16..24].copy_from_slice(&0x800000_u64.to_le_bytes()); // kernel size
+        buf[8..16].copy_from_slice(&0x80000_u64.to_le_bytes());
+        buf[16..24].copy_from_slice(&0x800000_u64.to_le_bytes());
         buf[56..60].copy_from_slice(KERNEL_MAGIC);
         let info = get_kernel_info(&buf).unwrap();
         assert_eq!(info.is_be, 0);
@@ -181,7 +159,6 @@ mod tests {
     fn decode_uefi_header() {
         let mut buf = vec![0u8; 128];
         buf[0..2].copy_from_slice(EFI_MAGIC);
-        // `b +0x40` at offset 4
         buf[4..8].copy_from_slice(&0x1400_0010_u32.to_le_bytes());
         buf[56..60].copy_from_slice(KERNEL_MAGIC);
         let info = get_kernel_info(&buf).unwrap();

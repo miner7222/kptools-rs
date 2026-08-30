@@ -1,4 +1,4 @@
-//! Kernel-image patch driver for KernelPatch 0.13.8.
+//! Kernel-image patch driver ported from upstream KernelPatch.
 
 use sha2::Digest;
 

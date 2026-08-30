@@ -1,6 +1,6 @@
 //! Kallsyms table parser.
 //!
-//! Port of upstream `tools/kallsym.{c,h}` at KernelPatch 0.13.8.
+//! Port of upstream `tools/kallsym.{c,h}`.
 
 use kptools_base::{logi, logw, Error, Result};
 

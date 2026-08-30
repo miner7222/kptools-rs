@@ -1,4 +1,4 @@
-//! CLI dispatcher compatible with KernelPatch kptools 0.13.8.
+//! CLI dispatcher compatible with upstream KernelPatch kptools.
 
 use std::path::PathBuf;
 

@@ -1,9 +1,7 @@
-//! On-disk preset structures + constants.
+//! On-disk preset ABI, ported from upstream `kernel/include/preset.h`.
 //!
-//! Direct port of upstream `kernel/include/preset.h`, pinned to
-//! tag 0.13.8. Field order, packing, and embedded size constants
-//! match the C build byte-for-byte so a patched kernel produced by
-//! this crate is interchangeable with the reference `kptools` binary.
+//! Field order, packing, and embedded size constants must match the C build
+//! byte-for-byte.
 
 use bytemuck::{Pod, Zeroable};
 

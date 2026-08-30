@@ -1,6 +1,6 @@
 //! x86_64 bzImage loader/repacker and KernelPatch payload injector.
 //!
-//! Port of upstream `tools/x86_64.{c,h}` at KernelPatch 0.13.8.
+//! Port of upstream `tools/x86_64.{c,h}`.
 //! Compression stays in-process through `flate2`; unlike upstream we
 //! never shell out to a system `gzip` binary.
 

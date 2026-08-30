@@ -1,6 +1,6 @@
 //! Symbol lookup helpers + map-area / patch-config fillers.
 //!
-//! Port of upstream `tools/symbol.{c,h}` at KernelPatch 0.13.8.
+//! Port of upstream `tools/symbol.{c,h}`.
 
 use kptools_base::{logi, logw, Error, Result};
 
@@ -147,9 +147,8 @@ pub fn select_map_area(
     let (addr, selected) = get_map_anchor_offset(info, img, imglen)?;
     logi!("select map anchor: {selected}, offset: 0x{addr:08x}");
 
-    // The hole must hold the whole map section (map_data + map code) so the
-    // map_prepare copy never spills past the NOP-synced area; 0.13.8 widened
-    // it from 0x800 to MAP_MAX_SIZE (0x1000).
+    // The hole must fit the whole map section so `map_prepare` cannot copy past
+    // the NOP-synchronized area.
     if !is_gki {
         return Ok((align_ceil(addr, 16), MAP_MAX_SIZE as i32));
     }

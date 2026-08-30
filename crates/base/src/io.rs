@@ -1,10 +1,4 @@
-//! Small I/O helpers — port of upstream's `read_file_align` +
-//! `read_file` + `write_file`.
-//!
-//! The C build mixes `malloc` + `FILE *`. The Rust side leans on
-//! `Vec<u8>` so the returned buffer owns its bytes (no twin
-//! length-out parameter) + hands ownership back up the stack with
-//! no `free()` ritual.
+//! File and alignment helpers ported from upstream tools.
 
 use std::fs::File;
 use std::io::{Read, Write};
@@ -20,9 +14,7 @@ pub fn read_file(path: &Path) -> Result<Vec<u8>> {
     Ok(buf)
 }
 
-/// Like [`read_file`], but zero-pad the tail up to the next multiple
-/// of `align`. Mirrors upstream's `read_file_align` that kpimg + KPM
-/// loads use so downstream patch-layout math stays aligned.
+/// Reads a file and zero-pads it to a multiple of `align`.
 pub fn read_file_align(path: &Path, align: usize) -> Result<Vec<u8>> {
     let mut buf = read_file(path)?;
     let aligned = align_ceil(buf.len(), align);
@@ -32,7 +24,7 @@ pub fn read_file_align(path: &Path, align: usize) -> Result<Vec<u8>> {
     Ok(buf)
 }
 
-/// Write `data` to `path`, overwriting anything that was there.
+/// Writes `data` to `path`, replacing an existing file.
 pub fn write_file(path: &Path, data: &[u8]) -> Result<()> {
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
@@ -89,9 +81,6 @@ mod tests {
     }
 
     fn tempdir_root() -> std::path::PathBuf {
-        // Avoid a `tempfile` dep here — the base crate's test tree
-        // stays dep-free and the kptools crate brings its own
-        // tempfile when it needs richer fixtures.
         let p = std::env::temp_dir().join(format!(
             "kptools-base-{}",
             std::time::SystemTime::now()

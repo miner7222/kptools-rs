@@ -1,26 +1,7 @@
-//! AOSP boot image unpack / repack.
+//! AOSP boot image unpacking and repacking.
 //!
-//! Port of upstream `tools/bootimg.{c,h}`. The upstream kptools
-//! binary ships its own boot-image handler because the patch
-//! pipeline needs to slot a recompressed kernel back in place
-//! with the same compression the original used, preserve any
-//! appended DTB, rebuild the SHA-1 / SHA-256 id, and touch up
-//! the AVB footer `data_size` field.
-//!
-//! Scope:
-//!
-//! - [`extract_kernel`] — upstream `extract_kernel`. Reads
-//!   `boot.img`, slices the kernel section at `page_size`, auto-
-//!   decompresses to `./kernel`.
-//! - [`repack_bootimg`] — upstream `repack_bootimg`. Re-compresses
-//!   the provided kernel to match the source's compression, writes
-//!   a new boot image with updated sizes + id digest + AVB footer.
-//! - [`calculate_sha1`] — upstream `cacluate_sha1` (typo intentional
-//!   to match the CLI subcommand name).
-//! - [`detect_compress_method`] — magic-byte sniffer. `0 raw,
-//!   1 gzip, 2 lz4-frame, 3 lz4-legacy, 4 zstd (unsupported),
-//!   5 bzip2, 6 xz, 7 lzma`.
-//! - [`auto_depress`] — dispatch on the sniffed method.
+//! Port of upstream `tools/bootimg.{c,h}`, including compression matching,
+//! appended DTB preservation, ID digests, and AVB footer updates.
 
 use std::fs::File;
 use std::io::{Read, Write};
@@ -35,9 +16,6 @@ pub const LZ4_MAGIC: u32 = 0x184c_2102;
 pub const LZ4_BLOCK_SIZE: usize = 0x0080_0000;
 pub const AVB_FOOTER_SIZE: usize = 64;
 
-// ---------------------------------------------------------------------------
-// Struct mirrors
-// ---------------------------------------------------------------------------
 
 #[repr(C, packed)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -79,9 +57,6 @@ pub struct AvbFooter {
     pub padding: [u8; 24],
 }
 
-// ---------------------------------------------------------------------------
-// SHA selection heuristic (upstream `is_sha256`)
-// ---------------------------------------------------------------------------
 
 /// 1 = SHA-256, 0 = SHA-1, 2 = ambiguous.
 pub fn is_sha256(id: &[u32; 8]) -> i32 {
@@ -94,9 +69,6 @@ pub fn is_sha256(id: &[u32; 8]) -> i32 {
     0
 }
 
-// ---------------------------------------------------------------------------
-// Compression method detect
-// ---------------------------------------------------------------------------
 
 pub fn detect_compress_method(magic: &[u8]) -> i32 {
     if magic.len() < 4 {
@@ -137,9 +109,6 @@ pub fn detect_compress_method(magic: &[u8]) -> i32 {
     0
 }
 
-// ---------------------------------------------------------------------------
-// Codec helpers
-// ---------------------------------------------------------------------------
 
 fn decompress_gzip_to(data: &[u8], out_path: &Path) -> Result<()> {
     use flate2::read::MultiGzDecoder;
@@ -157,9 +126,7 @@ fn compress_gzip(data: &[u8]) -> Result<Vec<u8>> {
     enc.finish().map_err(|e| Error::compress(e.to_string()))
 }
 
-/// Upstream `compress_raw_deflate` — raw DEFLATE (no zlib/gzip wrapper).
-/// Added in KernelPatch 0.13.2; not yet wired into the repack path but
-/// kept as a host-tools helper for parity with `tools/bootimg.c`.
+/// Raw DEFLATE helper retained for parity with upstream tools.
 #[allow(dead_code)]
 fn compress_raw_deflate(data: &[u8]) -> Result<Vec<u8>> {
     use flate2::write::DeflateEncoder;
@@ -222,23 +189,19 @@ fn decompress_lz4_legacy_to(data: &[u8], out_path: &Path) -> Result<()> {
     write_file(out_path, &out)
 }
 
-/// Compress to LZ4 legacy block format — matches upstream
-/// `compress_lz4_le`.
+/// Compresses to upstream's LZ4 legacy block format.
 fn compress_lz4_legacy(data: &[u8]) -> Result<Vec<u8>> {
     let mut out = Vec::with_capacity(data.len() + 4);
     out.extend_from_slice(&LZ4_MAGIC.to_le_bytes());
     for chunk in data.chunks(LZ4_BLOCK_SIZE) {
-        // High-compression block encode. lz4_flex's high-compression
-        // block path is not directly exposed as `compress_hc`, so we
-        // use the `lz4` crate's block API which supports HC level.
+        // `lz4` exposes high-compression blocks and lets this format write its
+        // own length prefix.
         let mut compressed = lz4::block::compress(
             chunk,
             Some(lz4::block::CompressionMode::HIGHCOMPRESSION(12)),
             false,
         )
         .map_err(|e| Error::compress(e.to_string()))?;
-        // `lz4::block::compress` with `prepend_size=false` returns
-        // raw bytes. We prepend our own length.
         let bs = compressed.len() as u32;
         out.extend_from_slice(&bs.to_le_bytes());
         out.append(&mut compressed);
@@ -291,9 +254,6 @@ fn decompress_zstd_to(data: &[u8], out_path: &Path) -> Result<()> {
     write_file(out_path, &buf)
 }
 
-// ---------------------------------------------------------------------------
-// auto_depress
-// ---------------------------------------------------------------------------
 
 pub fn auto_depress(data: &[u8], out_path: &Path) -> Result<()> {
     if data.len() < 4 {
@@ -339,8 +299,7 @@ pub fn auto_depress(data: &[u8], out_path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// In-memory analogue of upstream `auto_depress_to_mem`, used by the
-/// one-step Android boot-image patch path.
+/// Decompresses a kernel into memory using its detected format.
 pub fn auto_depress_to_mem(data: &[u8]) -> Result<Vec<u8>> {
     if data.len() < 4 {
         return Err(Error::decompress("auto_depress_to_mem: data too small"));
@@ -429,14 +388,8 @@ pub fn auto_depress_to_mem(data: &[u8]) -> Result<Vec<u8>> {
     Ok(out)
 }
 
-// ---------------------------------------------------------------------------
-// extract_kernel
-// ---------------------------------------------------------------------------
 
-/// Extract the kernel section from an AOSP boot image, auto-
-/// decompressing it, and write the result to `out_path`. Library-
-/// friendly replacement for upstream `extract_kernel(bootimg_path)`
-/// which hardcoded the output path to `./kernel`.
+/// Extracts and decompresses the kernel from an AOSP boot image.
 pub fn extract_kernel(bootimg_path: &Path, out_path: &Path) -> Result<()> {
     let data = kptools_base::io::read_file(bootimg_path)?;
     if data.len() < core::mem::size_of::<BootImgHdr>() {
@@ -450,11 +403,8 @@ pub fn extract_kernel(bootimg_path: &Path, out_path: &Path) -> Result<()> {
     let page_size = hdr.page_size;
     let header_ver = hdr.unused[0];
     let kernel_size = hdr.kernel_size as usize;
-    // Upstream's offset-selection mirror:
-    //   kernel_offset = page_size
-    //   if header_ver >= 3 → 4096
-    //   if header_ver > 10 → page_size (again; it's a sentinel for
-    //   "extracted_size encoded in unused[0]", not a real version)
+    // Values above 10 encode `extracted_size` in `unused[0]`, so upstream
+    // deliberately treats them as a sentinel rather than a header version.
     let mut kernel_offset = page_size;
     if header_ver >= 3 {
         kernel_offset = 4096;
@@ -484,9 +434,6 @@ pub fn is_bootimg(path: &Path) -> bool {
     file.read_exact(&mut magic).is_ok() && magic == *BOOT_MAGIC
 }
 
-// ---------------------------------------------------------------------------
-// repack_bootimg
-// ---------------------------------------------------------------------------
 
 /// Append-DTB detection scan: look for the flattened device tree
 /// magic `0xd00dfeed` followed by a sane `totalsize` + a
@@ -540,8 +487,7 @@ pub fn repack_bootimg(
     repack_bootimg_mem(orig_boot_path, &raw_k, out_boot_path)
 }
 
-/// In-memory analogue of upstream `repack_bootimg_mem`. Recompresses the
-/// supplied raw kernel using the source boot image's kernel compression.
+/// Repacks an in-memory kernel using the source boot image's compression.
 pub fn repack_bootimg_mem(
     orig_boot_path: &Path,
     new_kernel: &[u8],
@@ -584,7 +530,6 @@ pub fn repack_bootimg_mem(
     let old_k = &data[old_k_start..old_k_end];
     let method = detect_compress_method(&old_k[..4.min(old_k.len())]);
 
-    // Appended DTB (v1 / v2 only).
     let mut extracted_dtb: Vec<u8> = Vec::new();
     if header_ver < 3 {
         if let Some(dtb_off) = find_dtb_offset(old_k) {
@@ -598,8 +543,7 @@ pub fn repack_bootimg_mem(
 
     let raw_k = new_kernel;
 
-    // Recompress to match the source method. XZ / LZMA fall back
-    // to GZIP (upstream behaviour).
+    // Upstream falls back to GZIP when the source uses XZ or LZMA.
     let (final_k, final_method) = match method {
         1 => {
             logi!("Compressing new kernel with GZIP...");
@@ -639,9 +583,8 @@ pub fn repack_bootimg_mem(
     hdr.kernel_size = final_k_size + dtb_size;
     let mut checksum_aligned = align_up(fmt_size, page_size);
 
-    // Upstream zero-initializes the whole tail, copies everything except the
-    // separately-held AVB footer, and scans only the copied range for the last
-    // non-zero byte.
+    // Match upstream by excluding the separately held AVB footer and scanning
+    // only the copied tail for its last non-zero byte.
     let mut rest_buf: Vec<u8> = Vec::new();
     if rest_data_size > 0 {
         let copied_size = rest_data_size.saturating_sub(avb_size_of);
@@ -670,11 +613,9 @@ pub fn repack_bootimg_mem(
         }
     }
 
-    // Recompute the id digest. Upstream gates on
-    // `use_sha256 != 1 || header_ver <= 3` — the "1" case skips the
-    // hash rewrite for modern signed images where the bootloader
-    // trusts AVB alone. We drive both digests through `digest::DynDigest`
-    // so the update sequence stays identical between SHA-1 and SHA-256.
+    // Upstream skips the hash rewrite for modern signed images that rely on
+    // AVB alone. A dynamic digest keeps the update order identical for SHA-1
+    // and SHA-256.
     let id_copy = hdr.id;
     let use_sha256 = is_sha256(&id_copy);
     if use_sha256 != 1 || header_ver <= 3 {
@@ -731,17 +672,13 @@ pub fn repack_bootimg_mem(
         }
     }
 
-    // -- Assemble output file ---------------------------------------
     let mut out = Vec::with_capacity(total_size);
-    // 1) Header + zero-pad to page boundary.
     out.extend_from_slice(bytemuck::bytes_of(&hdr));
     out.resize(page_size as usize, 0);
-    // 2) Kernel + optional DTB tail.
     out.extend_from_slice(&final_k);
     if !extracted_dtb.is_empty() {
         out.extend_from_slice(&extracted_dtb);
     }
-    // 3) Pad kernel block to page.
     let new_k_total_aligned = align_up(hdr.kernel_size, page_size) as usize;
     let k_end = page_size as usize + new_k_total_aligned;
     if out.len() < k_end {
@@ -750,8 +687,6 @@ pub fn repack_bootimg_mem(
         out.truncate(k_end);
     }
 
-    // 4) Walk `rest_buf` for the AVB0 signature so we can patch the
-    //    AVB footer's `data_size{,_1,_2}` fields with the new size.
     let mut avb_sig: [u8; 19] = [
         0x41, 0x56, 0x42, 0x30, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
         0x00, 0x00, 0x00, 0x00,
@@ -792,8 +727,7 @@ pub fn repack_bootimg_mem(
         out.extend_from_slice(&rest_buf[..rest_data_size]);
     }
 
-    // 5) Final zero pad + append footer. The equality case still writes the
-    // footer, but it must not attempt a zero-length allocation/write first.
+    // The equality case must still append the footer without a zero-length pad.
     if out.len() <= total_size - avb_size_of {
         out.resize(total_size - avb_size_of, 0);
         out.extend_from_slice(bytemuck::bytes_of(&avb));
@@ -877,10 +811,6 @@ fn update_with_rest_dyn(d: &mut dyn digest::DynDigest, slice: &[u8], size: usize
     }
 }
 
-// ---------------------------------------------------------------------------
-// cacluate_sha1 (upstream typo preserved on the CLI side; the API
-// fn here uses the corrected spelling).
-// ---------------------------------------------------------------------------
 
 pub fn calculate_sha1(path: &Path) -> Result<[u8; 20]> {
     use sha1::{Digest, Sha1};
@@ -974,7 +904,6 @@ mod tests {
         let plain = b"raw deflate payload for kptools";
         let out = compress_raw_deflate(plain).unwrap();
         assert!(!out.is_empty());
-        // raw DEFLATE must not carry a gzip header (1f 8b)
         assert_ne!(&out[..2.min(out.len())], &[0x1f, 0x8b]);
     }
 
@@ -994,7 +923,6 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let plain = vec![0xCDu8; 65_536];
         let c = compress_lz4_legacy(&plain).unwrap();
-        // LZ4_MAGIC 0x184c2102 = bytes 02 21 4c 18 = legacy-detect.
         assert_eq!(detect_compress_method(&c[..4]), 3);
         let out = dir.path().join("o.bin");
         decompress_lz4_legacy_to(&c, &out).unwrap();
@@ -1006,7 +934,6 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let plain = b"kptools-rs bz2 test";
         let c = compress_bzip2(plain).unwrap();
-        // detect_compress_method requires at least 4 bytes.
         assert_eq!(detect_compress_method(&c[..4]), 5);
         let out = dir.path().join("o.bin");
         decompress_bzip2_to(&c, &out).unwrap();
@@ -1015,7 +942,6 @@ mod tests {
 
     #[test]
     fn sha1_matches_known_vector() {
-        // sha1("") = da39a3ee5e6b4b0d3255bfef95601890afd80709
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("e");
         std::fs::write(&p, b"").unwrap();
@@ -1029,18 +955,16 @@ mod tests {
 
     #[test]
     fn is_sha256_picks_format() {
-        // Upstream's first check short-circuits on `id[0..6] == 0`
-        // regardless of id[6..8], so these two produce 1.
+        // Upstream deliberately lets an all-zero first six words override the
+        // final two words.
         let id = [0u32; 8];
         assert_eq!(is_sha256(&id), 1);
         let mut id_tail = [0u32; 8];
         id_tail[7] = 1;
         assert_eq!(is_sha256(&id_tail), 1);
-        // id[0..6] any nonzero with id[6..8] == 0 → SHA-1.
         let mut id = [0u32; 8];
         id[0] = 1;
         assert_eq!(is_sha256(&id), 0);
-        // id[0..6] any nonzero with id[6..8] nonzero → ambiguous (2).
         let mut id = [0u32; 8];
         id[0] = 1;
         id[7] = 1;

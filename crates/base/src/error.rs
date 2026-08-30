@@ -1,9 +1,7 @@
-//! Workspace-wide error + result types.
+//! Workspace error and result types.
 //!
-//! Port replacement for upstream's `tools_loge_exit` macro, which just
-//! `exit()`s the process on any failure. A library target needs to
-//! surface errors as `Result<T, E>` instead so in-process callers
-//! can recover.
+//! These replace upstream process exits with errors that library callers can
+//! recover from.
 
 use std::io;
 

@@ -1,18 +1,13 @@
-//! Port of upstream's `tools_log{i,w,e}` + `tools_loge_exit` macros.
+//! Logging compatible with upstream `tools_log{i,w,e}`.
 //!
-//! Upstream threads a `bool log_enable` global through stdout
-//! `fprintf`s and exits the whole process on any error via
-//! `tools_loge_exit`. Library callers need both to be recoverable +
-//! silenceable, so we keep the log toggle but route errors through
-//! `Result` instead of `exit()`.
+//! The log toggle is retained, while fatal process exits are handled through
+//! recoverable errors elsewhere in the base crate.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
 static LOG_ENABLE: AtomicBool = AtomicBool::new(false);
 
-/// Turn the `[+] ... [?] ... [-] ...` chatter on or off. The CLI
-/// entry flips this to `true` for every command that used to call
-/// `set_log_enable(true)` in upstream.
+/// Enables or disables tool output.
 pub fn set_log_enable(on: bool) {
     LOG_ENABLE.store(on, Ordering::Relaxed);
 }
@@ -21,7 +16,7 @@ pub fn is_log_enabled() -> bool {
     LOG_ENABLE.load(Ordering::Relaxed)
 }
 
-/// `tools_logi` — informational. Prints when logging is enabled.
+/// Prints an informational message when logging is enabled.
 #[macro_export]
 macro_rules! logi {
     ($($arg:tt)*) => {{
@@ -32,7 +27,7 @@ macro_rules! logi {
     }};
 }
 
-/// `tools_logw` — warning.
+/// Prints a warning when logging is enabled.
 #[macro_export]
 macro_rules! logw {
     ($($arg:tt)*) => {{
@@ -43,8 +38,7 @@ macro_rules! logw {
     }};
 }
 
-/// `tools_loge` — error, but does not exit the process. Leaves the
-/// exit / error routing to the caller's `Result`.
+/// Prints an error without terminating the process.
 #[macro_export]
 macro_rules! loge {
     ($($arg:tt)*) => {{

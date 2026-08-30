@@ -1,19 +1,6 @@
 //! Arm64 A64 instruction helpers.
 //!
-//! This is the *subset* of upstream `tools/insn.c` + `tools/insn.h`
-//! that the `patch.c` + `kallsym.c` call graph actually touches.
-//! The upstream file is a 1 400-line copy of the Linux kernel's
-//! `arch/arm64/include/asm/insn.h` covering every A64 encoder, but
-//! kptools only exercises a handful:
-//!
-//! - `b_imm` / `b` — emit an unconditional branch.
-//! - `INSN_IS_B` — opcode-mask test on a decoded instruction.
-//! - `relo_branch_func` — follow a `b` instruction one hop and
-//!   return its target.
-//!
-//! Everything else is left for later phases to bring in on demand.
-//! Keeping the surface narrow prevents a 30 KB encoder table from
-//! compiling against every test target.
+//! The subset of upstream `tools/insn.{c,h}` used by patching and kallsyms.
 
 use kptools_base::{Error, Result};
 
@@ -23,7 +10,7 @@ pub const AARCH64_INSN_SIZE: usize = 4;
 const B_OPCODE_MASK: u32 = 0xFC00_0000;
 const B_OPCODE: u32 = 0x1400_0000;
 
-/// True iff `insn` encodes an unconditional `b` (not `bl`).
+/// Returns whether `insn` encodes an unconditional `b` (not `bl`).
 #[inline]
 pub const fn is_b(insn: u32) -> bool {
     (insn & B_OPCODE_MASK) == B_OPCODE
@@ -48,11 +35,8 @@ pub const fn sign64_extend(value: u64, bits: u32) -> i64 {
     ((value << shift) as i64) >> shift
 }
 
-/// Encode a `b from → to` instruction. `from` / `to` are absolute
-/// byte offsets; only the 26-bit `imm26` field is encoded, so the
-/// displacement must fit within ±128 MiB (inclusive). Returns 4 on
-/// success (instruction size), 0 when the displacement is out of
-/// range — matches upstream's contract.
+/// Encodes `b from → to`, returning 4 on success and 0 when the ±128 MiB
+/// displacement range is exceeded, matching upstream's contract.
 pub fn b(from: u64, to: u64) -> Result<u32> {
     if !can_b_imm(from, to) {
         return Err(Error::insn(format!(
@@ -64,9 +48,7 @@ pub fn b(from: u64, to: u64) -> Result<u32> {
     Ok(B_OPCODE | imm26 as u32)
 }
 
-/// Write `b from → to` into the 4 bytes starting at `buf[offset..]`.
-/// Convenience wrapper — upstream uses `uint32_t *buf` pointer
-/// arithmetic, we take an `&mut [u8]` slice instead.
+/// Writes `b from → to` at `buf[offset..]`.
 pub fn write_b(buf: &mut [u8], offset: usize, from: u64, to: u64) -> Result<()> {
     if offset.saturating_add(4) > buf.len() {
         return Err(Error::insn(format!(
@@ -79,8 +61,7 @@ pub fn write_b(buf: &mut [u8], offset: usize, from: u64, to: u64) -> Result<()> 
     Ok(())
 }
 
-/// Branch-displacement sanity check — imm26 encodes ±128 MiB.
-/// Mirrors upstream's `can_b_imm` helper.
+/// Returns whether the branch displacement fits in `imm26`.
 #[inline]
 pub fn can_b_imm(from: u64, to: u64) -> bool {
     let limit: u64 = 128 * 1024 * 1024;
@@ -91,15 +72,8 @@ pub fn can_b_imm(from: u64, to: u64) -> bool {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Decoder subset required by `kallsym::arm64_verify_pid_vnr`. Ports the
-// three helpers upstream's `kallsym.c` calls while walking the first six
-// instructions of `pid_vnr`: `aarch64_get_insn_class`,
-// `aarch64_insn_extract_system_reg`, and `aarch64_insn_decode_register`
-// (RN only — that's the only register the caller asks for).
 
-/// ARMv8 A64 main encoding class. Mirrors
-/// `enum aarch64_insn_encoding_class` from upstream `insn.h`.
+/// ARMv8 A64 main encoding class used by `pid_vnr` verification.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum InsnClass {
     Unknown,
@@ -110,8 +84,7 @@ pub enum InsnClass {
     BrSys,
 }
 
-/// Upstream `aarch64_insn_encoding_class[]` — indexed by bits `[28:25]`
-/// of the instruction word. See ARM ARM v8 Profile-A, section C3.1.
+/// ARMv8 encoding classes indexed by instruction bits `[28:25]`.
 const INSN_CLASS_TABLE: [InsnClass; 16] = [
     InsnClass::Unknown,
     InsnClass::Unknown,
@@ -137,7 +110,7 @@ pub const fn aarch64_get_insn_class(insn: u32) -> InsnClass {
     INSN_CLASS_TABLE[((insn >> 25) & 0xf) as usize]
 }
 
-/// A64 register type (subset — only RN is used by kallsym).
+/// A64 register type subset used by kallsyms.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RegType {
     Rt,
@@ -198,7 +171,6 @@ mod tests {
 
     #[test]
     fn encode_decode_roundtrip() {
-        // b +256 from offset 0.
         let insn = b(0, 256).unwrap();
         assert_eq!(insn, 0x1400_0040);
         assert!(is_b(insn));
@@ -209,10 +181,7 @@ mod tests {
     fn encode_negative_displacement() {
         let insn = b(0x1000, 0x0F00).unwrap();
         assert!(is_b(insn));
-        // Decoded target must round-trip.
         let bytes = insn.to_le_bytes();
-        // relo_branch_func expects the instruction at offset 0x1000
-        // inside an image; fabricate a tiny buffer.
         let mut buf = vec![0u8; 0x2000];
         buf[0x1000..0x1004].copy_from_slice(&bytes);
         assert_eq!(relo_branch_func(&buf, 0x1000), 0x0F00);
@@ -234,13 +203,11 @@ mod tests {
 
     #[test]
     fn is_b_rejects_bl() {
-        // BL = 0x94000000
         assert!(!is_b(0x9400_0000));
     }
 
     #[test]
     fn insn_class_mrs_sp_el0() {
-        // `mrs x1, sp_el0` = 0xD5384101.
         let insn = 0xD538_4101u32;
         assert_eq!(aarch64_get_insn_class(insn), InsnClass::BrSys);
         assert_eq!(
@@ -251,7 +218,6 @@ mod tests {
 
     #[test]
     fn insn_class_ldr_sp_base() {
-        // `ldr x0, [sp, #16]` = 0xF9400BE0  (class = LDST).
         let insn = 0xF940_0BE0u32;
         assert_eq!(aarch64_get_insn_class(insn), InsnClass::Ldst);
         assert_eq!(
@@ -262,7 +228,6 @@ mod tests {
 
     #[test]
     fn insn_class_add_imm_sp() {
-        // `add x29, sp, #0x10` = 0x910043FD  (class = DP_IMM, RN=SP).
         let insn = 0x9100_43FDu32;
         assert_eq!(aarch64_get_insn_class(insn), InsnClass::DpImm);
         assert_eq!(

@@ -1,26 +1,14 @@
-//! Byte-swap + host-endian helpers.
+//! Endianness helpers ported from upstream `tools/order.{c,h}`.
 //!
-//! Direct port of upstream `tools/order.{c,h}` — upstream exposes
-//! one swap function per scalar + an `is_be()` macro that reads a
-//! `uint16_t{1}` and checks the first byte. The Rust side collapses
-//! everything into two primitives (`is_be` + `swap_if`) and lets the
-//! caller mix-in whatever width it needs through the standard
-//! `swap_bytes` inherent.
-//!
-//! Upstream callers branch on `is_be() ^ kinfo->is_be` to decide
-//! whether to swap. Mirror that pattern rather than "always convert
-//! to LE on disk" — the preset layout carries whatever endianness
-//! the original kernel was built for, so a BE-host + BE-target pair
-//! writes identical bytes as the C build.
+//! Swap decisions mirror upstream's `is_be() ^ kinfo->is_be`; preset fields
+//! retain the target kernel's endianness.
 
-/// True iff the host is big-endian. Matches upstream's `is_be()`
-/// macro.
+/// Returns whether the host is big-endian.
 pub const fn is_be() -> bool {
     u16::from_ne_bytes([1, 0]) != 1
 }
 
-/// Swap `v` iff `swap` is true. Shorthand the port uses at every
-/// `is_be() ^ kinfo.is_be` site.
+/// Swaps `v` when `swap` is true.
 #[inline]
 pub fn swap_i16_if(v: i16, swap: bool) -> i16 {
     if swap {
@@ -70,7 +58,7 @@ pub fn swap_u64_if(v: u64, swap: bool) -> u64 {
     }
 }
 
-/// `is_be() ^ kinfo.is_be` shorthand.
+/// Returns whether target-endian values need swapping on this host.
 #[inline]
 pub fn needs_swap(target_is_be: bool) -> bool {
     is_be() ^ target_is_be
@@ -82,10 +70,6 @@ mod tests {
 
     #[test]
     fn host_endianness_is_le_on_intel() {
-        // The port targets little-endian hosts (x86_64, aarch64-LE).
-        // A big-endian host would just flip every swap branch, which
-        // is still correct; this asserts the expected development
-        // host for clarity.
         #[cfg(target_endian = "little")]
         assert!(!is_be());
         #[cfg(target_endian = "big")]

@@ -1,17 +1,6 @@
-//! KPM (Kernel Patch Module) ELF inspection.
+//! KPM ELF inspection, ported from upstream `tools/kpm.{c,h}`.
 //!
-//! Port of upstream `tools/kpm.{c,h}`. A KPM is a small relocatable
-//! ELF64 object that carries a `.kpm.info` section stuffed with
-//! `key=value\0` strings describing the module. We only need the
-//! read-side: given a `.kpm` file's bytes, pull out `name`,
-//! `version`, `license`, `author`, `description`.
-//!
-//! The upstream port rolls its own ELF walker to avoid a libelf
-//! dependency. The Rust side leans on the `object` crate but
-//! deliberately keeps the path small — the rest of the patch
-//! pipeline still ships pure-data structs, so we do the ELF parse
-//! by hand too (zero external deps here, matches base crate
-//! philosophy).
+//! KPM metadata is stored as `key=value\0` strings in `.kpm.info`.
 
 use bytemuck::{Pod, Zeroable};
 
@@ -63,9 +52,7 @@ struct Elf64Shdr {
     sh_entsize: u64,
 }
 
-/// Mirrors upstream `kpm_info_t`. All fields are `Option<String>`
-/// because a KPM may omit any tag — upstream's `get_modinfo`
-/// returns `NULL` there.
+/// KPM metadata; omitted tags remain `None` as in upstream `get_modinfo`.
 #[derive(Default, Debug, Clone)]
 pub struct KpmInfo {
     pub name: Option<String>,
@@ -75,16 +62,13 @@ pub struct KpmInfo {
     pub description: Option<String>,
 }
 
-/// Parse `kpm` (full ELF bytes) and extract the `.kpm.info`
-/// section's `key=value` pairs. Returns an error when the ELF
-/// header or the `.kpm.info` section is malformed.
+/// Extracts metadata from a KPM ELF image.
 pub fn get_kpm_info(kpm: &[u8]) -> Result<KpmInfo> {
     if kpm.len() < core::mem::size_of::<Elf64Ehdr>() {
         return Err(Error::bad_kpm("file too small for ELF header"));
     }
     let hdr: &Elf64Ehdr = bytemuck::from_bytes(&kpm[..core::mem::size_of::<Elf64Ehdr>()]);
 
-    // Header sanity.
     if &hdr.e_ident[..4] != ELFMAG {
         return Err(Error::bad_kpm("bad ELF magic"));
     }
@@ -119,7 +103,6 @@ pub fn get_kpm_info(kpm: &[u8]) -> Result<KpmInfo> {
 
     let sechdrs = parse_shdrs(kpm, shoff, shnum)?;
 
-    // Resolve the section name string table via `e_shstrndx`.
     let shstrndx = hdr.e_shstrndx as usize;
     if shstrndx >= sechdrs.len() {
         return Err(Error::bad_kpm("bad e_shstrndx"));
@@ -151,8 +134,7 @@ pub fn get_kpm_info(kpm: &[u8]) -> Result<KpmInfo> {
     Ok(out)
 }
 
-/// Port of upstream `print_kpm_info_path`. Reads `kpm_path`, prints
-/// `[kpm]` + `name/version/license/author/description` to stdout.
+/// Prints metadata from the KPM at `kpm_path`.
 pub fn print_kpm_info_path(kpm_path: &std::path::Path) -> Result<()> {
     let bytes = kptools_base::io::read_file(kpm_path)?;
     let info = get_kpm_info(&bytes)?;
@@ -194,9 +176,7 @@ fn find_sec<'a>(sechdrs: &'a [Elf64Shdr], secstrings: &[u8], name: &str) -> Opti
     None
 }
 
-/// Walk the `.kpm.info` section's `\0`-delimited `key=value` string
-/// list and return the value for `tag`. Mirrors upstream
-/// `get_modinfo`.
+/// Returns a tag from the null-delimited `.kpm.info` string list.
 fn modinfo_lookup(info: &[u8], tag: &str) -> Option<String> {
     let needle = format!("{tag}=");
     let mut i = 0usize;
@@ -210,8 +190,7 @@ fn modinfo_lookup(info: &[u8], tag: &str) -> Option<String> {
             return Some(String::from_utf8_lossy(value).into_owned());
         }
         i += end;
-        // Skip the null terminator + any run of subsequent nulls
-        // (upstream's `next_string` walks the same shape).
+        // Preserve upstream `next_string` behavior by skipping null runs.
         while i < info.len() && info[i] == 0 {
             i += 1;
         }
@@ -228,16 +207,14 @@ mod tests {
         let shdr_size = core::mem::size_of::<Elf64Shdr>();
 
         let mut buf = vec![0u8; ehdr_size];
-        // Place `.kpm.info` contents right after the ehdr.
         let info_off = buf.len();
         buf.extend_from_slice(info_bytes);
         while !buf.len().is_multiple_of(8) {
             buf.push(0);
         }
 
-        // Section name strings: "" (index 0), ".kpm.info" (index 1).
         let strtab_off = buf.len();
-        buf.push(0); // index 0: empty
+        buf.push(0);
         let kpm_info_name_idx = buf.len() - strtab_off;
         buf.extend_from_slice(b".kpm.info\0");
         let shstr_name_idx = buf.len() - strtab_off;
@@ -247,10 +224,6 @@ mod tests {
         }
         let strtab_size = buf.len() - strtab_off;
 
-        // Three section headers:
-        //   0: SHN_UNDEF (zeroed)
-        //   1: .kpm.info
-        //   2: .shstrtab
         let shoff = buf.len();
         buf.extend_from_slice(&vec![0u8; 3 * shdr_size]);
 
@@ -344,7 +317,6 @@ mod tests {
     fn rejects_not_aarch64() {
         let info = b"name=x\0";
         let mut elf = mk_elf_with_modinfo(info);
-        // Patch e_machine to something else.
         elf[0x12..0x14].copy_from_slice(&62u16.to_le_bytes()); // EM_X86_64
         assert!(get_kpm_info(&elf).is_err());
     }
