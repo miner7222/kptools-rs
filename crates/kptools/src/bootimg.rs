@@ -15,7 +15,7 @@ pub const PAGE_SIZE_DEFAULT: u32 = 4096;
 pub const LZ4_MAGIC: u32 = 0x184c_2102;
 pub const LZ4_BLOCK_SIZE: usize = 0x0080_0000;
 pub const AVB_FOOTER_SIZE: usize = 64;
-
+const AVB_VBMETA_MIN_SIZE: usize = 256;
 
 #[repr(C, packed)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -45,18 +45,14 @@ pub struct BootImgHdr {
 #[repr(C, packed)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 pub struct AvbFooter {
-    pub reverse: [u32; 16],
-    pub magic: u32,       // "AVBf"
-    pub version: u32,     // 0x00000001
-    pub reserved1: u64,   // 0
-    pub data_size1: u32,  // little-endian host view of the be64 avbtool writes
-    pub data_size_1: u32, // spare copy
-    pub data_size2: u32,
-    pub data_size_2: u32,
-    pub unknown_field: u64, // 0x940
-    pub padding: [u8; 24],
+    pub magic: [u8; 4],
+    pub version: [u8; 4],
+    pub reserved0: [u8; 4],
+    pub image_size: [u8; 8],
+    pub vbmeta_offset: [u8; 8],
+    pub vbmeta_size: [u8; 8],
+    pub reserved1: [u8; 28],
 }
-
 
 /// 1 = SHA-256, 0 = SHA-1, 2 = ambiguous.
 pub fn is_sha256(id: &[u32; 8]) -> i32 {
@@ -68,7 +64,6 @@ pub fn is_sha256(id: &[u32; 8]) -> i32 {
     }
     0
 }
-
 
 pub fn detect_compress_method(magic: &[u8]) -> i32 {
     if magic.len() < 4 {
@@ -108,7 +103,6 @@ pub fn detect_compress_method(magic: &[u8]) -> i32 {
     }
     0
 }
-
 
 fn decompress_gzip_to(data: &[u8], out_path: &Path) -> Result<()> {
     use flate2::read::MultiGzDecoder;
@@ -254,7 +248,6 @@ fn decompress_zstd_to(data: &[u8], out_path: &Path) -> Result<()> {
     write_file(out_path, &buf)
 }
 
-
 pub fn auto_depress(data: &[u8], out_path: &Path) -> Result<()> {
     if data.len() < 4 {
         return Err(Error::decompress("auto_depress: data too small"));
@@ -388,7 +381,6 @@ pub fn auto_depress_to_mem(data: &[u8]) -> Result<Vec<u8>> {
     Ok(out)
 }
 
-
 /// Extracts and decompresses the kernel from an AOSP boot image.
 pub fn extract_kernel(bootimg_path: &Path, out_path: &Path) -> Result<()> {
     let data = kptools_base::io::read_file(bootimg_path)?;
@@ -434,7 +426,6 @@ pub fn is_bootimg(path: &Path) -> bool {
     file.read_exact(&mut magic).is_ok() && magic == *BOOT_MAGIC
 }
 
-
 /// Append-DTB detection scan: look for the flattened device tree
 /// magic `0xd00dfeed` followed by a sane `totalsize` + a
 /// `FDT_BEGIN_NODE` tag at `off_dt_struct`.
@@ -478,6 +469,15 @@ fn align_up(v: u32, a: u32) -> u32 {
     }
 }
 
+fn shifted_offset(value: usize, old_start: usize, new_start: usize) -> Result<usize> {
+    if new_start >= old_start {
+        value.checked_add(new_start - old_start)
+    } else {
+        value.checked_sub(old_start - new_start)
+    }
+    .ok_or_else(|| Error::bad_bootimg("AVB offset shift overflow"))
+}
+
 pub fn repack_bootimg(
     orig_boot_path: &Path,
     new_kernel_path: &Path,
@@ -496,7 +496,7 @@ pub fn repack_bootimg_mem(
     logi!("Starting automatic repack...");
 
     let data = kptools_base::io::read_file(orig_boot_path)?;
-    if data.len() < core::mem::size_of::<BootImgHdr>() + AVB_FOOTER_SIZE {
+    if data.len() < core::mem::size_of::<BootImgHdr>() {
         return Err(Error::bad_bootimg("boot image truncated"));
     }
     let hdr_size = core::mem::size_of::<BootImgHdr>();
@@ -504,9 +504,11 @@ pub fn repack_bootimg_mem(
     if hdr.magic != *BOOT_MAGIC {
         return Err(Error::bad_bootimg("not an ANDROID! boot image"));
     }
-    let mut total_size = data.len();
+    let total_size = data.len();
     let avb_size_of = core::mem::size_of::<AvbFooter>();
-    let mut avb: AvbFooter = *bytemuck::from_bytes(&data[total_size - avb_size_of..]);
+    let avb = (total_size >= avb_size_of)
+        .then(|| *bytemuck::from_bytes::<AvbFooter>(&data[total_size - avb_size_of..]))
+        .filter(|footer| footer.magic == *b"AVBf");
 
     let mut header_ver = hdr.unused[0];
     let mut extracted_size: u32 = 0;
@@ -515,6 +517,9 @@ pub fn repack_bootimg_mem(
         header_ver = 0;
     }
     let page_size = if header_ver >= 3 { 4096 } else { hdr.page_size };
+    if (page_size as usize) < hdr_size {
+        return Err(Error::bad_bootimg("invalid boot image page size"));
+    }
     let fmt_size = if header_ver >= 3 {
         hdr.kernel_addr
     } else {
@@ -523,7 +528,9 @@ pub fn repack_bootimg_mem(
     logi!("Header Version: {header_ver}, Page Size: {page_size}, fmt_size: {fmt_size}");
 
     let old_k_start = page_size as usize;
-    let old_k_end = old_k_start + hdr.kernel_size as usize;
+    let old_k_end = old_k_start
+        .checked_add(hdr.kernel_size as usize)
+        .ok_or_else(|| Error::bad_bootimg("kernel section overflow"))?;
     if old_k_end > data.len() {
         return Err(Error::bad_bootimg("kernel section past file end"));
     }
@@ -573,45 +580,79 @@ pub fn repack_bootimg_mem(
         _ => (raw_k.to_vec(), 0),
     };
     let _ = final_method;
-    let final_k_size = final_k.len() as u32;
+    let final_k_size = u32::try_from(final_k.len())
+        .map_err(|_| Error::bad_bootimg("repacked kernel exceeds u32"))?;
     logi!("Final kernel size after compression (if applied): {final_k_size} bytes");
 
-    let dtb_size = extracted_dtb.len() as u32;
-    let old_k_aligned = align_up(hdr.kernel_size, page_size);
-    let rest_data_offset = page_size as usize + old_k_aligned as usize;
-    let mut rest_data_size = total_size.saturating_sub(rest_data_offset);
-    hdr.kernel_size = final_k_size + dtb_size;
+    let dtb_size = u32::try_from(extracted_dtb.len())
+        .map_err(|_| Error::bad_bootimg("appended DTB exceeds u32"))?;
+    let old_k_aligned = (hdr.kernel_size as usize)
+        .div_ceil(page_size as usize)
+        .checked_mul(page_size as usize)
+        .ok_or_else(|| Error::bad_bootimg("kernel padding overflow"))?;
+    let rest_data_offset = (page_size as usize)
+        .checked_add(old_k_aligned)
+        .ok_or_else(|| Error::bad_bootimg("rest data offset overflow"))?;
+    if rest_data_offset > total_size {
+        return Err(Error::bad_bootimg("padded kernel past file end"));
+    }
+    hdr.kernel_size = final_k_size
+        .checked_add(dtb_size)
+        .ok_or_else(|| Error::bad_bootimg("repacked kernel size overflow"))?;
+    let new_k_total_aligned = (hdr.kernel_size as usize)
+        .div_ceil(page_size as usize)
+        .checked_mul(page_size as usize)
+        .ok_or_else(|| Error::bad_bootimg("repacked kernel padding overflow"))?;
+    let new_rest_offset = (page_size as usize)
+        .checked_add(new_k_total_aligned)
+        .ok_or_else(|| Error::bad_bootimg("repacked rest offset overflow"))?;
+    let avb_metadata = if let Some(footer) = avb {
+        let old_image_size = usize::try_from(u64::from_be_bytes(footer.image_size))
+            .map_err(|_| Error::bad_bootimg("AVB image_size overflow"))?;
+        let old_vbmeta_offset = usize::try_from(u64::from_be_bytes(footer.vbmeta_offset))
+            .map_err(|_| Error::bad_bootimg("AVB vbmeta_offset overflow"))?;
+        let vbmeta_size = usize::try_from(u64::from_be_bytes(footer.vbmeta_size))
+            .map_err(|_| Error::bad_bootimg("AVB vbmeta_size overflow"))?;
+        let footer_offset = total_size - avb_size_of;
+        let metadata_end = old_vbmeta_offset
+            .checked_add(vbmeta_size)
+            .ok_or_else(|| Error::bad_bootimg("AVB metadata bounds overflow"))?;
+        if footer_offset < rest_data_offset
+            || u32::from_be_bytes(footer.version) != 1
+            || old_image_size < rest_data_offset
+            || old_vbmeta_offset < old_image_size
+            || old_vbmeta_offset < rest_data_offset
+            || vbmeta_size < AVB_VBMETA_MIN_SIZE
+            || metadata_end > footer_offset
+            || &data[old_vbmeta_offset..old_vbmeta_offset + 4] != b"AVB0"
+        {
+            return Err(Error::bad_bootimg("invalid AVB footer or metadata"));
+        }
+        let new_image_size = shifted_offset(old_image_size, rest_data_offset, new_rest_offset)?;
+        let new_vbmeta_offset =
+            shifted_offset(old_vbmeta_offset, rest_data_offset, new_rest_offset)?;
+        if new_image_size < new_rest_offset || new_vbmeta_offset < new_image_size {
+            return Err(Error::bad_bootimg("shifted AVB bounds invalid"));
+        }
+        Some((
+            footer,
+            old_vbmeta_offset,
+            vbmeta_size,
+            new_image_size,
+            new_vbmeta_offset,
+        ))
+    } else {
+        None
+    };
     let mut checksum_aligned = align_up(fmt_size, page_size);
 
-    // Match upstream by excluding the separately held AVB footer and scanning
-    // only the copied tail for its last non-zero byte.
-    let mut rest_buf: Vec<u8> = Vec::new();
-    if rest_data_size > 0 {
-        let copied_size = rest_data_size.saturating_sub(avb_size_of);
-        let copied_end = rest_data_offset
-            .checked_add(copied_size)
-            .ok_or_else(|| Error::bad_bootimg("rest data range overflow"))?;
-        if copied_end > data.len() {
-            return Err(Error::bad_bootimg("rest data past file end"));
-        }
-        let mut rest_buf_tmp = vec![0u8; rest_data_size];
-        rest_buf_tmp[..copied_size].copy_from_slice(&data[rest_data_offset..copied_end]);
-        let mut tail_off = copied_size;
-        while tail_off > 0 && rest_buf_tmp[tail_off - 1] == 0 {
-            tail_off -= 1;
-        }
-        if tail_off > rest_data_size / 3 * 2 {
-            logi!(
-                "warning: overload size of rest data. Rest data size: {rest_data_size}, actual used size: {tail_off}"
-            );
-            rest_buf = rest_buf_tmp;
-            rest_data_size = tail_off + avb_size_of;
-        } else {
-            rest_buf = rest_buf_tmp[..tail_off].to_vec();
-            logi!("Rest data size: {rest_data_size}, actual used size: {tail_off}");
-            rest_data_size = tail_off;
-        }
-    }
+    // Every byte following the padded kernel is opaque except a recognized AVB footer.
+    let tail_end = if avb.is_some() {
+        total_size - avb_size_of
+    } else {
+        total_size
+    };
+    let rest_buf = &data[rest_data_offset..tail_end];
 
     // Upstream skips the hash rewrite for modern signed images that rely on
     // AVB alone. A dynamic digest keeps the update order identical for SHA-1
@@ -626,11 +667,11 @@ pub fn repack_bootimg_mem(
         };
         dyn_ctx.update(&final_k);
         dyn_ctx.update(&hdr.kernel_size.to_le_bytes());
-        update_with_rest_dyn(&mut *dyn_ctx, &rest_buf, fmt_size as usize);
+        update_with_rest_dyn(&mut *dyn_ctx, rest_buf, fmt_size as usize);
         dyn_ctx.update(&fmt_size.to_le_bytes());
         update_with_rest_dyn(
             &mut *dyn_ctx,
-            sec_slice(&rest_buf, checksum_aligned, hdr.second_size),
+            sec_slice(rest_buf, checksum_aligned, hdr.second_size),
             hdr.second_size as usize,
         );
         dyn_ctx.update(&hdr.second_size.to_le_bytes());
@@ -640,7 +681,7 @@ pub fn repack_bootimg_mem(
         if extracted_size != 0 {
             update_with_rest_dyn(
                 &mut *dyn_ctx,
-                sec_slice(&rest_buf, checksum_aligned, page_size),
+                sec_slice(rest_buf, checksum_aligned, page_size),
                 page_size as usize,
             );
             dyn_ctx.update(&extracted_size.to_le_bytes());
@@ -649,7 +690,7 @@ pub fn repack_bootimg_mem(
         if header_ver == 1 || header_ver == 2 {
             update_with_rest_dyn(
                 &mut *dyn_ctx,
-                sec_slice(&rest_buf, checksum_aligned, hdr.recovery_dtbo_size),
+                sec_slice(rest_buf, checksum_aligned, hdr.recovery_dtbo_size),
                 hdr.recovery_dtbo_size as usize,
             );
             dyn_ctx.update(&hdr.recovery_dtbo_size.to_le_bytes());
@@ -658,7 +699,7 @@ pub fn repack_bootimg_mem(
         if header_ver == 2 {
             update_with_rest_dyn(
                 &mut *dyn_ctx,
-                sec_slice(&rest_buf, checksum_aligned, hdr.dtb_size),
+                sec_slice(rest_buf, checksum_aligned, hdr.dtb_size),
                 hdr.dtb_size as usize,
             );
             dyn_ctx.update(&hdr.dtb_size.to_le_bytes());
@@ -679,58 +720,51 @@ pub fn repack_bootimg_mem(
     if !extracted_dtb.is_empty() {
         out.extend_from_slice(&extracted_dtb);
     }
-    let new_k_total_aligned = align_up(hdr.kernel_size, page_size) as usize;
-    let k_end = page_size as usize + new_k_total_aligned;
+    let k_end = new_rest_offset;
     if out.len() < k_end {
         out.resize(k_end, 0);
     } else {
         out.truncate(k_end);
     }
 
-    let mut avb_sig: [u8; 19] = [
-        0x41, 0x56, 0x42, 0x30, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00,
-    ];
-    if !rest_buf.is_empty() {
-        let scan_len = rest_data_size.min(rest_buf.len());
-        let scan_buf = &rest_buf[..scan_len];
-        let mut last_avb: Option<usize> = None;
-        for ver in [0x00u8, 0x01, 0x02] {
-            avb_sig[18] = ver;
-            let mut search = 0usize;
-            while search + avb_sig.len() <= scan_buf.len() {
-                let Some(rel) = scan_buf[search..]
-                    .windows(avb_sig.len())
-                    .position(|w| w == avb_sig)
-                else {
-                    break;
-                };
-                last_avb = Some(search + rel);
-                search += rel + avb_sig.len();
-            }
-            if last_avb.is_some() {
-                break;
-            }
+    // AVB images commonly reserve zero slack before the footer. Reuse it when
+    // the padded kernel grows, but never trim any part of the metadata blob.
+    let copied_tail = if let Some((_, old_offset, size, _, _)) = avb_metadata {
+        let metadata_end = old_offset + size - rest_data_offset;
+        let last_nonzero = rest_buf.iter().rposition(|&b| b != 0).map_or(0, |i| i + 1);
+        &rest_buf[..metadata_end.max(last_nonzero)]
+    } else {
+        rest_buf
+    };
+    out.extend_from_slice(copied_tail);
+    if let Some((mut footer, old_offset, size, new_image_size, new_offset)) = avb_metadata {
+        let new_end = new_offset
+            .checked_add(size)
+            .ok_or_else(|| Error::bad_bootimg("shifted AVB metadata overflow"))?;
+        let original_end = old_offset + size;
+        if new_end > out.len() || out[new_offset..new_end] != data[old_offset..original_end] {
+            return Err(Error::bad_bootimg("AVB metadata was not preserved"));
         }
-        if let Some(avb_offset) = last_avb {
-            let new_avb_size = page_size + avb_offset as u32 + new_k_total_aligned as u32;
-            avb.data_size1 = new_avb_size.swap_bytes();
-            avb.data_size2 = new_avb_size.swap_bytes();
+        let required_size = out
+            .len()
+            .checked_add(avb_size_of)
+            .ok_or_else(|| Error::bad_bootimg("repacked AVB image size overflow"))?;
+        let footer_start = if required_size <= total_size {
+            total_size - avb_size_of
+        } else {
+            required_size
+                .div_ceil(page_size as usize)
+                .checked_mul(page_size as usize)
+                .and_then(|size| size.checked_sub(avb_size_of))
+                .ok_or_else(|| Error::bad_bootimg("repacked AVB image padding overflow"))?
+        };
+        if new_end > footer_start {
+            return Err(Error::bad_bootimg("AVB metadata overlaps footer"));
         }
-        if rest_data_size > total_size.saturating_sub(page_size as usize + new_k_total_aligned) {
-            total_size = align_up(
-                (page_size as usize + new_k_total_aligned + rest_data_size) as u32,
-                page_size,
-            ) as usize;
-        }
-        debug_assert!(rest_data_size <= rest_buf.len());
-        out.extend_from_slice(&rest_buf[..rest_data_size]);
-    }
-
-    // The equality case must still append the footer without a zero-length pad.
-    if out.len() <= total_size - avb_size_of {
-        out.resize(total_size - avb_size_of, 0);
-        out.extend_from_slice(bytemuck::bytes_of(&avb));
+        out.resize(footer_start, 0);
+        footer.image_size = (new_image_size as u64).to_be_bytes();
+        footer.vbmeta_offset = (new_offset as u64).to_be_bytes();
+        out.extend_from_slice(bytemuck::bytes_of(&footer));
     }
 
     write_file(out_boot_path, &out)?;
@@ -811,7 +845,6 @@ fn update_with_rest_dyn(d: &mut dyn digest::DynDigest, slice: &[u8], size: usize
     }
 }
 
-
 pub fn calculate_sha1(path: &Path) -> Result<[u8; 20]> {
     use sha1::{Digest, Sha1};
     let mut f = File::open(path).map_err(Error::Io)?;
@@ -833,6 +866,139 @@ pub fn calculate_sha1(path: &Path) -> Result<[u8; 20]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn raw_boot_image(kernel_size: usize, tail: &[u8]) -> Vec<u8> {
+        let mut hdr = BootImgHdr::zeroed();
+        hdr.magic = *BOOT_MAGIC;
+        hdr.kernel_size = kernel_size as u32;
+        hdr.page_size = PAGE_SIZE_DEFAULT;
+        let rest_start = PAGE_SIZE_DEFAULT as usize
+            + kernel_size.div_ceil(PAGE_SIZE_DEFAULT as usize) * PAGE_SIZE_DEFAULT as usize;
+        let mut image = vec![0u8; rest_start];
+        image[..core::mem::size_of::<BootImgHdr>()].copy_from_slice(bytemuck::bytes_of(&hdr));
+        image[PAGE_SIZE_DEFAULT as usize..PAGE_SIZE_DEFAULT as usize + kernel_size].fill(b'K');
+        image.extend_from_slice(tail);
+        image
+    }
+
+    fn avb_boot_image(kernel_size: usize) -> (Vec<u8>, usize) {
+        let rest_start = PAGE_SIZE_DEFAULT as usize
+            + kernel_size.div_ceil(PAGE_SIZE_DEFAULT as usize) * PAGE_SIZE_DEFAULT as usize;
+        let mut tail = vec![0x5a; 512];
+        tail[8..12].copy_from_slice(b"AVB0"); // Decoy before the footer-selected blob.
+        tail[128..132].copy_from_slice(b"AVB0");
+        tail[400..404].copy_from_slice(b"AVB0"); // Decoy after it, which a last-match scan would choose.
+        let mut footer = AvbFooter::zeroed();
+        footer.magic = *b"AVBf";
+        footer.version = 1u32.to_be_bytes();
+        footer.reserved0 = [0xa5; 4];
+        footer.reserved1 = [0x5a; 28];
+        footer.image_size = (rest_start as u64).to_be_bytes();
+        footer.vbmeta_offset = ((rest_start + 128) as u64).to_be_bytes();
+        footer.vbmeta_size = 256u64.to_be_bytes();
+        tail.extend_from_slice(bytemuck::bytes_of(&footer));
+        (raw_boot_image(kernel_size, &tail), rest_start)
+    }
+
+    fn repack_fixture(image: &[u8], kernel: &[u8]) -> Result<Vec<u8>> {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("in.img");
+        let output = dir.path().join("out.img");
+        std::fs::write(&input, image).unwrap();
+        repack_bootimg_mem(&input, kernel, &output)?;
+        Ok(std::fs::read(output).unwrap())
+    }
+
+    #[test]
+    fn avb_footer_tracks_padded_kernel_delta_and_selected_blob() {
+        for (old_size, new_size) in [(4usize, 5000usize), (5000, 4), (4, 4)] {
+            let (image, old_rest) = avb_boot_image(old_size);
+            let new_rest = PAGE_SIZE_DEFAULT as usize
+                + new_size.div_ceil(PAGE_SIZE_DEFAULT as usize) * PAGE_SIZE_DEFAULT as usize;
+            let output = repack_fixture(&image, &vec![b'N'; new_size]).unwrap();
+            let footer: AvbFooter =
+                *bytemuck::from_bytes(&output[output.len() - AVB_FOOTER_SIZE..]);
+            assert_eq!(footer.magic, *b"AVBf");
+            assert_eq!(u64::from_be_bytes(footer.image_size), new_rest as u64);
+            assert_eq!(
+                u64::from_be_bytes(footer.vbmeta_offset),
+                (new_rest + 128) as u64
+            );
+            assert_eq!(u64::from_be_bytes(footer.vbmeta_size), 256);
+            assert_eq!(footer.reserved0, [0xa5; 4]);
+            assert_eq!(footer.reserved1, [0x5a; 28]);
+            assert_eq!(
+                &output[new_rest..new_rest + 512],
+                &image[old_rest..old_rest + 512]
+            );
+            assert_eq!(
+                &output[new_rest + 128..new_rest + 384],
+                &image[old_rest + 128..old_rest + 384]
+            );
+        }
+    }
+
+    #[test]
+    fn avb_zero_slack_absorbs_growth_without_trimming_zero_metadata() {
+        let (mut image, old_rest) = avb_boot_image(4);
+        image[old_rest + 132..old_rest + 384].fill(0);
+        image[old_rest + 384..old_rest + 512].fill(0);
+        let old_footer = image.len() - AVB_FOOTER_SIZE;
+        image.splice(old_footer..old_footer, vec![0; 8192]);
+        let output = repack_fixture(&image, &vec![b'N'; 5000]).unwrap();
+        let new_rest = old_rest + PAGE_SIZE_DEFAULT as usize;
+        assert_eq!(output.len(), image.len());
+        assert_eq!(
+            &output[new_rest + 128..new_rest + 384],
+            &image[old_rest + 128..old_rest + 384]
+        );
+        let footer: AvbFooter = *bytemuck::from_bytes(&output[output.len() - AVB_FOOTER_SIZE..]);
+        assert_eq!(
+            u64::from_be_bytes(footer.vbmeta_offset),
+            (new_rest + 128) as u64
+        );
+
+        let large = repack_fixture(&image, &vec![b'N'; 20000]).unwrap();
+        assert!(large.len() > image.len());
+        assert_eq!(large.len() % PAGE_SIZE_DEFAULT as usize, 0);
+    }
+
+    #[test]
+    fn malformed_avb_keeps_existing_output_untouched() {
+        let (image, rest) = avb_boot_image(4);
+        let footer = image.len() - AVB_FOOTER_SIZE;
+        type Mutation = Box<dyn Fn(&mut Vec<u8>)>;
+        let mutations: Vec<Mutation> = vec![
+            Box::new(move |v| v[footer + 4..footer + 8].copy_from_slice(&2u32.to_be_bytes())),
+            Box::new(move |v| {
+                v[footer + 12..footer + 20].copy_from_slice(&((rest - 1) as u64).to_be_bytes())
+            }),
+            Box::new(move |v| v[footer + 20..footer + 28].copy_from_slice(&u64::MAX.to_be_bytes())),
+            Box::new(move |v| v[footer + 28..footer + 36].copy_from_slice(&u64::MAX.to_be_bytes())),
+            Box::new(move |v| v[footer + 28..footer + 36].copy_from_slice(&255u64.to_be_bytes())),
+            Box::new(move |v| v[rest + 128..rest + 132].copy_from_slice(b"NOPE")),
+        ];
+        for mutate in mutations {
+            let dir = tempfile::tempdir().unwrap();
+            let input = dir.path().join("in.img");
+            let output = dir.path().join("out.img");
+            let mut bad = image.clone();
+            mutate(&mut bad);
+            std::fs::write(&input, bad).unwrap();
+            std::fs::write(&output, b"unchanged").unwrap();
+            assert!(repack_bootimg_mem(&input, b"NEWS", &output).is_err());
+            assert_eq!(std::fs::read(&output).unwrap(), b"unchanged");
+        }
+    }
+
+    #[test]
+    fn non_avb_short_and_long_tails_remain_opaque() {
+        for tail in [b"abc".as_slice(), &[0x7f; 80]] {
+            let image = raw_boot_image(4, tail);
+            let output = repack_fixture(&image, b"NEWS").unwrap();
+            assert_eq!(&output[PAGE_SIZE_DEFAULT as usize * 2..], tail);
+        }
+    }
 
     #[test]
     fn detect_compress_method_covers_known_magics() {

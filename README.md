@@ -4,6 +4,13 @@ A pure-Rust implementation of the KernelPatch userspace tools. It patches arm64
 raw kernel images and x86_64 `bzImage` kernels with a `kpimg`, requires no C
 toolchain, and handles compression in-process.
 
+The userspace port tracks [KernelPatch 0.13.9](https://github.com/bmax121/KernelPatch/releases/tag/0.13.9)
+(`b51197aaba8f2272dd8a3e30c85698a29aa928c9`). Its changes from 0.13.8 affect
+boot image AVB footer handling; kernel runtime changes are outside this crate.
+Repacking uses the footer's recorded vbmeta location, preserves the metadata
+bytes, and rejects invalid metadata references before writing the output.
+Preserving metadata does not re-sign the modified image.
+
 ## Build
 
 ```sh
